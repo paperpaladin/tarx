@@ -1,0 +1,3 @@
+tarx
+*.o
+t/tmp/
