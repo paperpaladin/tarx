@@ -33,6 +33,10 @@
 
 #define BLK 512
 
+/* A pax extended header is attacker-controlled and length-prefixed, so it is
+ * the one place a hostile archive can ask us to allocate.  Cap it. */
+#define PAX_MAX (1u << 20)
+
 /* All ustar fields are fixed-width char arrays, so this struct has no padding
  * and sizeof == 512 on every ABI we care about. */
 struct tarhdr {
@@ -285,6 +289,70 @@ static void mode_str(mode_t m, int type, char out[11])
 	out[10] = '\0';
 }
 
+/* Parse "<len> <key>=<value>\n" records.  `len` includes itself, so a record
+ * can claim a length that runs off the end of the buffer -- check every step. */
+static void parse_pax(const char *buf, size_t n, char **path, char **link)
+{
+	size_t i = 0;
+	while (i < n) {
+		size_t start = i, len = 0;
+		while (i < n && buf[i] >= '0' && buf[i] <= '9') {
+			if (len > PAX_MAX)
+				return;
+			len = len * 10 + (size_t)(buf[i++] - '0');
+		}
+		if (i == start || i >= n || buf[i] != ' ')
+			return;	/* malformed: stop, keep what we have */
+		i++;
+		if (len < i - start + 1 || start + len > n)
+			return;
+		size_t end = start + len;	/* points just past the '\n' */
+		const char *eq = memchr(buf + i, '=', end - i);
+		if (!eq)
+			return;
+		size_t klen = (size_t)(eq - (buf + i));
+		const char *v = eq + 1;
+		size_t vlen = end - 1 - (size_t)(v - buf);	/* drop trailing \n */
+		char *val = xmalloc(vlen + 1);
+		memcpy(val, v, vlen);
+		val[vlen] = '\0';
+		if (klen == 4 && !memcmp(buf + i, "path", 4)) {
+			free(*path);
+			*path = val;
+		} else if (klen == 8 && !memcmp(buf + i, "linkpath", 8)) {
+			free(*link);
+			*link = val;
+		} else {
+			/* shortcut: unknown pax keywords (size, mtime, uid,
+			 * atime, SCHILY.*, LIBARCHIVE.*) are ignored.  Ceiling:
+			 * a GNU-sparse-1.0 or >8EiB member would be read wrong.
+			 * Upgrade path: a keyword table feeding the same
+			 * override struct `path`/`link` already use. */
+			free(val);
+		}
+		i = end;
+	}
+}
+
+/* Read `size` bytes of member data plus its block padding into a buffer. */
+static char *read_data(uint64_t size, size_t *outn)
+{
+	if (size > PAX_MAX)
+		die("header payload of %llu bytes is implausible",
+		    (unsigned long long)size);
+	size_t n = (size_t)size;
+	char *buf = xmalloc(n + 1);
+	if (xread(afd, buf, n) != n)
+		die("unexpected end of archive in header payload");
+	buf[n] = '\0';
+	size_t pad = (BLK - (n % BLK)) % BLK;
+	char junk[BLK];
+	if (pad)
+		xread(afd, junk, pad);
+	*outn = n;
+	return buf;
+}
+
 static void skip_data(uint64_t size)
 {
 	uint64_t total = size + ((BLK - (size % BLK)) % BLK);
@@ -331,6 +399,7 @@ static void extract_data(const char *path, uint64_t size, mode_t mode)
 
 static void do_read(int extract)
 {
+	char *ov_path = NULL, *ov_link = NULL;
 	int saw_any = 0;
 
 	for (;;) {
@@ -385,38 +454,51 @@ static void do_read(int extract)
 		if (type == '\0')
 			type = T_REG;	/* ancient tars left it NUL */
 
-		if (type == T_PAX || type == T_PAXG ||
-		    type == T_GNU_LONGNAME || type == T_GNU_LONGLINK) {
-			/* shortcut: long names arrive in a header of their own, and
-			 * we do not read them yet, so the member that follows keeps
-			 * whatever truncated name is in its fixed field.  Ceiling:
-			 * any archive with a path over 100 bytes.  Upgrade path: pax
-			 * and GNU 'L'/'K' parsing -- the very next commit. */
-			warn_("long-name header ignored, names may be truncated");
-			failures++;
-			skip_data(size);
+		if (type == T_PAX || type == T_PAXG) {
+			size_t n;
+			char *d = read_data(size, &n);
+			if (type == T_PAX)
+				parse_pax(d, n, &ov_path, &ov_link);
+			free(d);
+			continue;
+		}
+		if (type == T_GNU_LONGNAME || type == T_GNU_LONGLINK) {
+			size_t n;
+			char *d = read_data(size, &n);
+			d[n] = '\0';
+			char **slot = type == T_GNU_LONGNAME ? &ov_path : &ov_link;
+			free(*slot);
+			*slot = xstrdup(d);	/* stored NUL-terminated */
+			free(d);
 			continue;
 		}
 
-		/* Join prefix and name with a '/'.  The prefix field only
-		 * means anything in ustar/pax -- pre-ustar tars reuse those
-		 * offsets, so honouring it unconditionally would glue garbage
-		 * onto the front of every name from a v7 archive. */
+		/* Assemble the real name: pax/GNU override beats the fixed
+		 * fields; otherwise join prefix and name with a '/'. */
 		char namebuf[256 + 2];
-		const char *name = namebuf;
-		char nm[101], pf[156];
-		memcpy(nm, h.name, 100);
-		nm[100] = '\0';
-		memcpy(pf, h.prefix, 155);
-		pf[155] = '\0';
-		if (pf[0] && !memcmp(h.magic, "ustar", 5))
-			snprintf(namebuf, sizeof namebuf, "%s/%s", pf, nm);
-		else
-			snprintf(namebuf, sizeof namebuf, "%s", nm);
+		const char *name;
+		if (ov_path) {
+			name = ov_path;
+		} else {
+			char nm[101], pf[156];
+			memcpy(nm, h.name, 100);
+			nm[100] = '\0';
+			memcpy(pf, h.prefix, 155);
+			pf[155] = '\0';
+			/* The prefix field only means anything in ustar/pax. */
+			if (pf[0] && !memcmp(h.magic, "ustar", 5))
+				snprintf(namebuf, sizeof namebuf, "%s/%s", pf, nm);
+			else
+				snprintf(namebuf, sizeof namebuf, "%s", nm);
+			name = namebuf;
+		}
 		char lnkbuf[101];
-		memcpy(lnkbuf, h.linkname, 100);
-		lnkbuf[100] = '\0';
-		const char *lname = lnkbuf;
+		const char *lname = ov_link;
+		if (!lname) {
+			memcpy(lnkbuf, h.linkname, 100);
+			lnkbuf[100] = '\0';
+			lname = lnkbuf;
+		}
 
 		/* Trailing slash with a regular typeflag means a directory in
 		 * pre-ustar archives. */
@@ -518,7 +600,12 @@ static void do_read(int extract)
 
  next:
 		free(clean);
+		free(ov_path);
+		free(ov_link);
+		ov_path = ov_link = NULL;
 	}
+	free(ov_path);
+	free(ov_link);
 	if (extract)
 		flush_defers();
 }
