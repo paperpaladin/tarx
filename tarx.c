@@ -149,26 +149,26 @@ static size_t xread(int fd, void *buf, size_t n)
 
 /* ustar stores numbers as right-aligned zero-padded octal ASCII with a NUL (or
  * space) terminator, so an n-byte field holds at most 8^(n-1)-1: the 12-byte
- * size field tops out at 8589934591, i.e. 8 GiB - 1.
- *
- * shortcut: a value that does not fit is clamped with a warning.  Ceiling: any
- * member over 8 GiB - 1 bytes.  Upgrade path: base-256 encoding, which the
- * reader already understands -- the very next commit. */
+ * size field tops out at 8589934591, i.e. 8 GiB - 1.  For anything larger GNU
+ * tar and star use "base-256": set bit 7 of byte 0 as a flag and read the whole
+ * field as a big-endian two's-complement integer.  We only ever emit the
+ * positive form (byte 0 == 0x80, value in the remaining n-1 bytes). */
 static void put_num(char *p, size_t n, uint64_t v)
 {
-	uint64_t max = ((uint64_t)1 << (3 * (n - 1))) - 1;
-	char tmp[32];
-
-	if (v > max) {
-		warn_("value %llu does not fit an octal field, clamped",
-		      (unsigned long long)v);
-		failures++;
-		v = max;
+	if (v < ((uint64_t)1 << (3 * (n - 1)))) {
+		char tmp[32];
+		snprintf(tmp, sizeof tmp, "%0*llo", (int)(n - 1),
+			 (unsigned long long)v);
+		memcpy(p, tmp, n - 1);
+		p[n - 1] = '\0';
+	} else {
+		memset(p, 0, n);
+		p[0] = (char)0x80;
+		for (size_t i = n - 1; i >= 1; i--) {
+			p[i] = (char)(v & 0xff);
+			v >>= 8;
+		}
 	}
-	snprintf(tmp, sizeof tmp, "%0*llo", (int)(n - 1),
-		 (unsigned long long)v);
-	memcpy(p, tmp, n - 1);
-	p[n - 1] = '\0';
 }
 
 static int get_num(const char *p, size_t n, uint64_t *out)
