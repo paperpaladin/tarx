@@ -11,8 +11,11 @@ all: tarx
 tarx: tarx.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(LDFLAGS)
 
+test: tarx
+	@t/run.sh
+
 clean:
 	rm -f tarx
 	rm -rf t/tmp
 
-.PHONY: all clean
+.PHONY: all test clean
