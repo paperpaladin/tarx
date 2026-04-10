@@ -1,6 +1,7 @@
 #!/bin/bash
 # tarx test harness.  GNU tar is the oracle: every interop claim below is
-# checked against the real thing, in both directions.
+# checked against the real thing, in both directions.  Set TARX_SKIP_BIG=1 to
+# skip the 9 GiB base-256 tests (the asan build does, they are I/O bound).
 set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -147,6 +148,28 @@ mkdir -p "$TMP/mid" "$TMP/rt2"
 "$GNUTAR" -cf "$TMP/mid.tar" -C "$TMP/mid" tree
 assert "tarx->GNU->tarx triple hop extracts" "$TARX" -xf "$TMP/mid.tar" -C "$TMP/rt2"
 assert "tarx->GNU->tarx: diff -r byte-identical" diff -r "$TMP/tree" "$TMP/rt2/tree"
+
+# ===================================================================== #
+# 6. base-256 size encoding: a 9 GiB member                             #
+# ===================================================================== #
+BIGSZ=9663676416
+if [ "${TARX_SKIP_BIG:-0}" = 1 ]; then
+	echo "skip big-file (base-256) tests: TARX_SKIP_BIG=1"
+elif ! (mkdir -p "$TMP/big" && truncate -s 9G "$TMP/big/big.bin") 2>/dev/null; then
+	echo "skip big-file (base-256) tests: filesystem will not make a 9G file"
+else
+	# Piped so neither side needs 9 GiB of archive on disk.
+	got=$("$TARX" -cf - -C "$TMP" big | "$GNUTAR" -tvf - | awk '/big.bin/{print $3}')
+	eq "tarx->GNU: GNU tar reads our base-256 9G size" "$got" "$BIGSZ"
+	got=$("$GNUTAR" -cf - -C "$TMP" big | "$TARX" -tvf - | awk '/big.bin/{print $3}')
+	eq "GNU->tarx: tarx reads GNU's base-256 9G size" "$got" "$BIGSZ"
+	mkdir -p "$TMP/bigx"
+	assert "tarx round-trips a 9G member" \
+		sh -c "'$TARX' -cf - -C '$TMP' big | '$TARX' -xf - -C '$TMP/bigx'"
+	eq "9G member extracts at full size" "$(stat -c %s "$TMP/bigx/big/big.bin")" "$BIGSZ"
+	assert "9G member is byte-identical" cmp "$TMP/big/big.bin" "$TMP/bigx/big/big.bin"
+	rm -f "$TMP/bigx/big/big.bin" "$TMP/big/big.bin"
+fi
 
 # ===================================================================== #
 echo
