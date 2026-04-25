@@ -31,10 +31,6 @@ eq()   { if [ "$2" = "$3" ]; then ok "$1"; else no "$1 (got '$2' want '$3')"; fi
 # Every awkward case the format has: nesting, a symlink, a hard link, a
 # >100-byte path that CAN be ustar-split, a >100-byte path that CANNOT (forcing
 # pax), an empty file, mode 0700, and binary data with NUL bytes.
-# shortcut: diff -r follows symlinks, so the symlink comparisons below are
-# weaker than they look and a dangling link would abort diff outright.  Ceiling:
-# an extractor that got every target wrong would still pass.  Upgrade path:
-# diff --no-dereference plus a readlink per link.
 build_tree() {
 	local d=$1
 	rm -rf "$d"
@@ -48,7 +44,10 @@ build_tree() {
 	printf 'a' >"$d/sp ace.txt"
 	printf 'b' >"$d/üñí©ode.txt"
 	ln -s a/f1 "$d/sym"
+	# link target over 100 bytes: forces pax linkpath=
+	ln -s "$(python3 -c 'print("t/"*60 + "z")')" "$d/longsym"
 	ln -s ../f1 "$d/a/b/relsym"
+	ln -s nowhere/at/all "$d/dangling"
 	ln "$d/a/f1" "$d/hard"
 	# 150-byte member path, splittable on a '/': exercises prefix[155]+name[100].
 	local p
@@ -80,11 +79,12 @@ assert "GNU tar sees every member tarx wrote" diff -q "$TMP/gnu.list" "$TMP/find
 
 mkdir -p "$TMP/gx"
 assert "GNU tar -xf extracts a tarx archive" "$GNUTAR" -xf "$TMP/x.tar" -C "$TMP/gx"
-assert "tarx->GNU: diff -r byte-identical" diff -r "$TMP/tree" "$TMP/gx/tree"
+assert "tarx->GNU: diff -r byte-identical" diff -r --no-dereference "$TMP/tree" "$TMP/gx/tree"
 eq "tarx->GNU: mode 0700 preserved" "$(stat -c %a "$TMP/gx/tree/mode700")" 700
 eq "tarx->GNU: mode 0400 preserved" "$(stat -c %a "$TMP/gx/tree/mode400")" 400
 eq "tarx->GNU: symlink target preserved" "$(readlink "$TMP/gx/tree/sym")" a/f1
 eq "tarx->GNU: relative symlink preserved" "$(readlink "$TMP/gx/tree/a/b/relsym")" ../f1
+eq "tarx->GNU: dangling symlink preserved" "$(readlink "$TMP/gx/tree/dangling")" nowhere/at/all
 eq "tarx->GNU: hard link shares an inode" \
 	"$(stat -c %i "$TMP/gx/tree/hard")" "$(stat -c %i "$TMP/gx/tree/a/f1")"
 eq "tarx->GNU: empty file is empty" "$(stat -c %s "$TMP/gx/tree/empty")" 0
@@ -108,7 +108,7 @@ for fmt in gnu oldgnu posix; do
 	eq "GNU($fmt)->tarx: list has $MEMBER_COUNT members" \
 		"$("$TARX" -tf "$arc" | wc -l)" "$MEMBER_COUNT"
 	assert "GNU($fmt)->tarx: extract succeeds" "$TARX" -xf "$arc" -C "$dst"
-	assert "GNU($fmt)->tarx: diff -r byte-identical" diff -r "$TMP/tree" "$dst/tree"
+	assert "GNU($fmt)->tarx: diff -r byte-identical" diff -r --no-dereference "$TMP/tree" "$dst/tree"
 	eq "GNU($fmt)->tarx: mode 0700 preserved" "$(stat -c %a "$dst/tree/mode700")" 700
 	eq "GNU($fmt)->tarx: symlink target preserved" "$(readlink "$dst/tree/sym")" a/f1
 	eq "GNU($fmt)->tarx: hard link shares an inode" \
@@ -117,18 +117,18 @@ for fmt in gnu oldgnu posix; do
 		"$(stat -c %Y "$dst/tree/a/f1")" "$(stat -c %Y "$TMP/tree/a/f1")"
 done
 
-# Strict ustar cannot represent the unsplittable >100-byte name at all -- GNU
-# tar refuses to dump it ("file name is too long (cannot be split)"), which is
-# the oracle confirming pax is not optional.  Test the pure-ustar path on a tree
-# without it.
+# Strict ustar cannot represent an unsplittable >100-byte name or a >100-byte
+# link target at all -- GNU tar refuses to dump both ("file name is too long
+# (cannot be split)", "link name is too long"), which is the oracle confirming
+# pax is not optional.  Test the pure-ustar path on a tree without them.
 cp -a "$TMP/tree" "$TMP/ustree"
-rm -f "$TMP/ustree/"$(printf 'P%.0s' $(seq 150))
+rm -f "$TMP/ustree/"$(printf 'P%.0s' $(seq 150)) "$TMP/ustree/longsym"
 assert "GNU tar writes --format=ustar for the splittable tree" \
 	"$GNUTAR" --format=ustar -cf "$TMP/g_ustar.tar" -C "$TMP" ustree
 mkdir -p "$TMP/tx_ustar"
 assert "GNU(ustar)->tarx: extract succeeds" "$TARX" -xf "$TMP/g_ustar.tar" -C "$TMP/tx_ustar"
 assert "GNU(ustar)->tarx: diff -r byte-identical" \
-	diff -r "$TMP/ustree" "$TMP/tx_ustar/ustree"
+	diff -r --no-dereference "$TMP/ustree" "$TMP/tx_ustar/ustree"
 
 # ===================================================================== #
 # 3. tarx -> tarx round trip                                            #
@@ -136,7 +136,7 @@ assert "GNU(ustar)->tarx: diff -r byte-identical" \
 mkdir -p "$TMP/rt"
 assert "tarx->tarx round trip extracts" \
 	sh -c "'$TARX' -cf - -C '$TMP' tree | '$TARX' -xf - -C '$TMP/rt'"
-assert "tarx->tarx: diff -r byte-identical" diff -r "$TMP/tree" "$TMP/rt/tree"
+assert "tarx->tarx: diff -r byte-identical" diff -r --no-dereference "$TMP/tree" "$TMP/rt/tree"
 eq "tarx->tarx: mode 0700 preserved" "$(stat -c %a "$TMP/rt/tree/mode700")" 700
 eq "tarx->tarx: symlink target preserved" "$(readlink "$TMP/rt/tree/sym")" a/f1
 eq "tarx->tarx: hard link shares an inode" \
@@ -147,7 +147,12 @@ mkdir -p "$TMP/mid" "$TMP/rt2"
 "$GNUTAR" -xf "$TMP/x.tar" -C "$TMP/mid"
 "$GNUTAR" -cf "$TMP/mid.tar" -C "$TMP/mid" tree
 assert "tarx->GNU->tarx triple hop extracts" "$TARX" -xf "$TMP/mid.tar" -C "$TMP/rt2"
-assert "tarx->GNU->tarx: diff -r byte-identical" diff -r "$TMP/tree" "$TMP/rt2/tree"
+assert "tarx->GNU->tarx: diff -r byte-identical" diff -r --no-dereference "$TMP/tree" "$TMP/rt2/tree"
+
+eq "tarx->GNU: >100 byte symlink target preserved (pax linkpath)" \
+	"$(readlink "$TMP/gx/tree/longsym")" "$(readlink "$TMP/tree/longsym")"
+eq "tarx->tarx: >100 byte symlink target preserved" \
+	"$(readlink "$TMP/rt/tree/longsym")" "$(readlink "$TMP/tree/longsym")"
 
 # ===================================================================== #
 # 4. long-path encodings: prefix split vs pax                           #
@@ -158,7 +163,7 @@ assert "tarx->GNU->tarx: diff -r byte-identical" diff -r "$TMP/tree" "$TMP/rt2/t
 python3 - "$TMP/x.tar" <<'PY' && ok "long paths use the right encodings" || no "long paths use the right encodings"
 import sys
 data = open(sys.argv[1], 'rb').read()
-split_seen = pax_seen = False
+split_seen = pax_seen = paxlink_seen = False
 off = 0
 while off + 512 <= len(data):
     h = data[off:off+512]
@@ -170,7 +175,9 @@ while off + 512 <= len(data):
     size = int(h[124:136].split(b'\0')[0].strip() or b'0', 8)
     if typ == 'x':
         body = data[off+512:off+512+size].decode()
-        if ' path=' in body:
+        if 'linkpath=' in body:
+            paxlink_seen = True
+        elif ' path=' in body:
             pax_seen = True
     if prefix and 's'*25 in name:
         split_seen = True
@@ -179,6 +186,7 @@ while off + 512 <= len(data):
     off += 512 + (size + 511) // 512 * 512
 assert split_seen, "no ustar prefix/name split emitted"
 assert pax_seen, "no pax extended header path= emitted"
+assert paxlink_seen, "no pax extended header linkpath= emitted"
 PY
 
 # ===================================================================== #
