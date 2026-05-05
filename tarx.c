@@ -671,6 +671,24 @@ static void defer_dir(const char *path, mode_t mode, time_t mtime)
 	ndef++;
 }
 
+/* An archive is untrusted input, so honouring its setuid/setgid/sticky bits
+ * would let it hand an unprivileged extractor a setuid file it did not ask for.
+ * GNU tar drops those bits unless you pass -p or are root; we match that -- the
+ * oracle caught us restoring 04755 where GNU restored 0755, and GNU is right.
+ *
+ * shortcut: we do NOT additionally apply umask, so the ordinary 0777 bits come
+ * back exactly (what `tar -p` does) rather than being masked (what plain `tar`
+ * does).  Ceiling: a 0666 file extracted by tarx is 0666, by GNU tar 0644.
+ * Upgrade path: a -p flag that selects between the two, which is the only
+ * reason to have the flag at all. */
+static mode_t safe_mode(uint64_t m)
+{
+	static int root = -1;
+	if (root < 0)
+		root = geteuid() == 0;
+	return (mode_t)(m & (root ? 07777 : 00777));
+}
+
 static void set_times(const char *path, time_t mtime)
 {
 	struct timespec ts[2];
@@ -1034,11 +1052,11 @@ static void do_read(int extract)
 					break;
 				}
 			}
-			defer_dir(clean, (mode_t)(mode & 07777), (time_t)mtime);
+			defer_dir(clean, safe_mode(mode), (time_t)mtime);
 			break;
 		case T_REG:
 		case T_CONT:
-			extract_data(clean, size, (mode_t)(mode & 07777));
+			extract_data(clean, size, safe_mode(mode));
 			set_times(clean, (time_t)mtime);
 			break;
 		case T_SYM:
@@ -1062,7 +1080,7 @@ static void do_read(int extract)
 			}
 			break;
 		case T_FIFO:
-			if (mkfifo(clean, (mode_t)(mode & 07777)) < 0) {
+			if (mkfifo(clean, safe_mode(mode)) < 0) {
 				warn_("mkfifo %s: %s", clean, strerror(errno));
 				failures++;
 			} else {
