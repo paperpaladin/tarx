@@ -19,7 +19,8 @@ tarx -c|-t|-x [-v] [-f ARCHIVE] [-C DIR] [PATH...]
 In scope, on both the write and the read side:
 
 * regular files, directories, symlinks, hard links, FIFOs
-* permission bits and mtime
+* permission bits and mtime.  setuid/setgid/sticky are always *stored*; they
+  are only *restored* when extracting as root, matching plain `tar -x`.
 * paths longer than 100 bytes, by **ustar `prefix`/`name` split** when the path
   has a `/` in the legal window, and by **pax extended header** (`path=`) when
   it does not
@@ -63,7 +64,7 @@ Ranked, strongest first.
    pax header, the unsplittable one produced a `path=` record, the 122-byte
    symlink target produced a `linkpath=` record, and the file ends in exactly
    two zero blocks and no more.
-3. **Traversal refusal, with the escape proven absent.** Hostile
+3. **Traversal refusal, with the escape proven absent.** Fifteen hostile
    archives (hand-written headers, plus two built by GNU `tar -P` so the oracle
    itself vouches that the nasty path really is in there). Each asserts a
    nonzero exit, a `REFUSING` message, that nothing appeared beside the
@@ -93,34 +94,43 @@ Ranked, strongest first.
   `--exclude`, `--strip-components`, incremental archives, volume labels,
   multi-volume archives, `--blocking-factor`.
 * Sub-second mtime precision (no pax `mtime=` with a fraction).
+* A `-p`/`--preserve-permissions` flag. tarx always restores the 0777 bits
+  exactly (ignoring umask, like `tar -xp`) and always drops setuid/setgid/sticky
+  unless root (like plain `tar -x`). One fixed policy, no flag to pick.
 * Being fast. The data path is a 64 KiB `read`/`write` loop with no `sendfile`,
   no `copy_file_range`, no hole detection.
 
 ## Commit sequence
 
-- [ ] ustar header: the 512-byte struct, octal and base-256 numeric fields,
+- [x] ustar header: the 512-byte struct, octal and base-256 numeric fields,
       the checksum-over-spaces rule
       why: every other decision depends on these three being exactly right,
       and all three are the parts people get subtly wrong.
-- [ ] `-c` for regular files, dirs, symlinks, hard links, FIFOs; sorted
+- [x] `-c` for regular files, dirs, symlinks, hard links, FIFOs; sorted
       traversal; two trailing zero blocks
       why: produce something GNU tar can read before trying to read anything,
       so the oracle can be pointed at us from day one.
-- [ ] long paths: `prefix`/`name` split, pax `path=`/`linkpath=` fallback
+- [x] long paths: `prefix`/`name` split, pax `path=`/`linkpath=` fallback
       why: the 100-byte limit is the first wall every real tree hits, and the
       split rules are fiddly enough to deserve their own step.
-- [ ] `-t`/`-x`: pax and GNU `L`/`K` on read, deferred directory
+- [x] `-t`/`-x`: pax and GNU `L`/`K` on read, deferred directory
       modes/mtimes, `-C`, stdin/stdout archives
       why: deferring dir metadata is the only way a mode-0500 directory
       extracts with its children intact.
-- [ ] security: absolute/`..` refusal, symlink-target escape analysis,
+- [x] security: absolute/`..` refusal, symlink-target escape analysis,
       `lstat` on every parent component, `unlink`+`O_EXCL|O_NOFOLLOW` writes
       why: this is the whole reason the project is interesting; it goes in
       before any convenience feature, not after.
-- [ ] the harness: bidirectional GNU interop, byte-level encoding assertions,
+- [x] the harness: bidirectional GNU interop, byte-level encoding assertions,
       fifteen hostile archives, malformed input, 1000 mutations, 9 GiB
       why: a claim about tar interop that is not checked against tar is a
       guess.
+- [x] drop setuid/setgid/sticky bits on extract unless root
+      why: the oracle caught us restoring 04755 where GNU tar restored 0755.
+      GNU is right -- an untrusted archive must not be able to hand an
+      unprivileged user a setuid file -- and it is a one-line policy, so it
+      belongs in the first release rather than a TODO.
+
 ### Milestone 1 -- the gaps that bite real users
 
 - [ ] read GNU sparse members (`typeflag` `S`, and pax
@@ -163,6 +173,11 @@ Ranked, strongest first.
       byte, then diff the two listings in the harness
       why: right now the harness compares member *sets*, not the full `-tv`
       output, so a formatting divergence would go unnoticed.
+- [ ] `-p`/`--preserve-permissions` and umask-aware extraction, so the two
+      permission policies are selectable and both match GNU exactly
+      why: tarx currently sits between GNU's two modes (no umask like `-xp`,
+      no setuid like plain `-x`), which is defensible but is a divergence the
+      harness documents rather than tests away.
 - [ ] `-r`/`-u` (append and update) by seeking back over the zero blocks
       why: requires the archive fd to be seekable, which is the first place
       the pipe-friendly design has to grow a special case.
