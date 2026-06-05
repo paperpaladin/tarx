@@ -53,10 +53,10 @@ worse than one that stops.
 
 Ranked, strongest first.
 
-1. **GNU tar 1.35, bidirectionally.** `tarx -c` → `tar -xf` → `diff -r
+1. **GNU tar 1.35, bidirectionally.** `tarx -c` -> `tar -xf` -> `diff -r
    --no-dereference` plus explicit `stat`/`readlink`/inode comparisons, and the
    reverse for `--format=` each of `gnu`, `oldgnu`, `posix`, `ustar`. Also the
-   three-hop `tarx → GNU → tarx`. Non-negotiable: tar defines the format.
+   three-hop `tarx -> GNU -> tarx`. Non-negotiable: tar defines the format.
 2. **Byte-level assertions on the archive tarx produced.** `diff -r` passing
    proves the pair agree, not that the encoding is right -- a pax header for
    *every* long path would also pass. A Python reader walks the raw 512-byte
