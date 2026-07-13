@@ -298,7 +298,7 @@ terminator; `-f -` for pipes; the full traversal-refusal set above. Clean under
 
 ## Design
 
-One file, ~1100 lines, three parts.
+One file, 1181 lines, three parts.
 
 *Header codec.* A `struct tarhdr` of nothing but `char` arrays, so it has no
 padding and a `_Static_assert` pins `sizeof` at 512. `put_num`/`get_num` handle
