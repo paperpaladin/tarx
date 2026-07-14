@@ -37,9 +37,14 @@ not parseable.
 **1. GNU tar and tarx agree in both directions.** Anything `tarx -c` writes,
 GNU `tar -tvf` lists correctly and `tar -xf` extracts to byte-identical files
 with the same modes, symlink targets and hard-link identity. Anything GNU tar
-writes in `v7`-through-`pax` format, `tarx -t` lists and `tarx -x` extracts to
-byte-identical files. This is not a design goal, it is the acceptance test: if
-the two disagree, tarx is wrong, because tar is the format.
+writes in `ustar`, `gnu`, `oldgnu` or `posix`/`pax` format, `tarx -t` lists
+and `tarx -x` extracts to byte-identical files. Not `v7`: this said
+"`v7`-through-`pax`" and the harness has never covered v7, because v7 cannot
+represent the test fixture at all -- GNU tar refuses its long path outright
+("file name is too long (max 99); not dumped"), v7 having no prefix field.
+
+This is not a design goal, it is the acceptance test: if the two disagree,
+tarx is wrong, because tar is the format.
 
 **2. No member can ever be written outside the destination.** Not by an
 absolute path, not by `..`, not by a symlink whose target climbs out, not by a
@@ -61,7 +66,7 @@ Ranked, strongest first.
    proves the pair agree, not that the encoding is right -- a pax header for
    *every* long path would also pass. A Python reader walks the raw 512-byte
    blocks and asserts the splittable 150-byte path used `prefix`+`name` with no
-   pax header, the unsplittable one produced a `path=` record, the 122-byte
+   pax header, the unsplittable one produced a `path=` record, the 121-byte
    symlink target produced a `linkpath=` record, and the file ends in exactly
    two zero blocks and no more.
 3. **Traversal refusal, with the escape proven absent.** Fifteen hostile
@@ -75,7 +80,8 @@ Ranked, strongest first.
    pass an extractor that got every target wrong, and it fails outright on a
    dangling one.
 5. **ASan + UBSan over the whole harness** (`make test-asan`), plus 1000
-   single-byte mutations of a real archive fed to the header parser, asserting
+   mutations of a real archive, 1 to 4 bytes each, fed to the header parser,
+   asserting
    no process ever dies on a signal. Valgrind is clean on create, list and
    extract but is not wired into `make test`.
 6. **`cmp` on a 9 GiB member**, and the size field read back through GNU tar

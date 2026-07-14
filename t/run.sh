@@ -425,7 +425,7 @@ for bad in trunc_hdr trunc_mid random zero; do
 	fi
 done
 
-# A thousand single-byte mutations of a real archive: the header parser must
+# A thousand mutations of a real archive, 1 to 4 bytes each: the header parser must
 # never fault.  Cheap stand-in for the real fuzzer in PLAN.md.
 python3 - "$TMP" "$TARX" <<'PY' && ok "1000 mutated archives: no crashes" || no "1000 mutated archives: crashed"
 import random, subprocess, sys
