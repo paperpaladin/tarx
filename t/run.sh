@@ -364,8 +364,16 @@ assert "GNU tar -P really stored an absolute path (oracle sanity)" \
 	sh -c "'$GNUTAR' -tf '$TMP/evil/gnu_absolute_real.tar' | grep -qx '/tmp/tarx-should-never-write-this'"
 EVILS="$EVILS gnu_dotdot_real gnu_absolute_real"
 
+# One canary per absolute path the evil archives aim at. There used to be
+# only /tmp/tarx-should-never-write-this, and the `abs_prefix` member aims at
+# /tmp/escape -- prefix "/tmp" plus name "escape" -- which is neither inside
+# the jail nor that canary. So for that case checks (b) and (c) below could
+# not observe the escape at all (both look only under $jail) and the whole
+# assertion rested on (a), the REFUSING message. A stub that printed REFUSING
+# and wrote the payload outside the jail passed all three.
+CANARIES="/tmp/tarx-should-never-write-this /tmp/escape"
 CANARY=/tmp/tarx-should-never-write-this
-rm -f "$CANARY"
+for c in $CANARIES; do rm -f "$c"; done
 for ev in $EVILS; do
 	jail=$TMP/jail/$ev
 	rm -rf "$jail"
@@ -384,11 +392,16 @@ for ev in $EVILS; do
 	stray=$(cd "$jail" && find . -mindepth 1 -maxdepth 1 ! -name dest)
 	eq "refuse[$ev]: nothing written beside the destination" "$stray" ""
 
-	# (c) and nothing with the payload landed anywhere under the jail
-	hits=$(grep -rl PWNED "$jail" 2>/dev/null | tr '\n' ' ')
+	# (c) and nothing with the payload landed anywhere under the jail, or
+	# at any of the absolute paths these archives aim at. The second half
+	# is what makes this meaningful for abs_prefix and absolute, whose
+	# targets are outside $jail by construction.
+	hits=$(grep -rl PWNED "$jail" $CANARIES 2>/dev/null | tr '\n' ' ')
 	eq "refuse[$ev]: payload never written" "$hits" ""
 done
-refute "the absolute-path canary $CANARY was never created" test -e "$CANARY"
+for c in $CANARIES; do
+	refute "the absolute-path canary $c was never created" test -e "$c"
+done
 
 # The refusal must be per-member, not fatal: in the mixed archive extracted by
 # the loop above, the good members must have landed anyway.
