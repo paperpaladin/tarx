@@ -24,7 +24,7 @@ reputation: a 512-byte header of ASCII octal fields, the file's bytes padded to
 512, repeat, two zero blocks at the end. The complexity is entirely in three
 places that are easy to get *almost* right:
 
-* the checksum, which is the unsigned sum of all 512 header bytes *with the
+* the checksum, the unsigned sum of all 512 header bytes *with the
   checksum field itself counted as eight ASCII spaces*. It has to be, since you
   cannot include a value in the sum you are computing to produce it;
 * the `prefix`/`name` split, which lets a 255-byte path into a format whose
@@ -316,7 +316,7 @@ decides between the `prefix` split and a pax header. The pax record length field
 counts itself, so computing it is a two-iteration fixed point.
 
 *Read.* One loop over 512-byte blocks. Pax `x` and GNU `L`/`K` members set
-`ov_path`/`ov_link` overrides consumed by the *next* real member, which is also
+`ov_path`/`ov_link` overrides consumed by the *next* real member, also
 why the security checks live after the name is assembled, not where the
 header is parsed. Directory modes and mtimes are deferred to a list and applied
 in reverse at the end, because a mode-0500 directory has to be writable while
