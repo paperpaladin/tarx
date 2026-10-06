@@ -107,6 +107,23 @@ static char *xstrdup(const char *s)
 
 /* ---------------------------------------------------------------- raw I/O */
 
+/* shortcut: unused until -c exists; xwrite is here because extract_data needs
+ * it too and one short-write loop is enough for both. */
+static void xwrite(int fd, const void *buf, size_t n)
+{
+	const char *p = buf;
+	while (n) {
+		ssize_t w = write(fd, p, n);
+		if (w < 0) {
+			if (errno == EINTR)
+				continue;
+			die("write: %s", strerror(errno));
+		}
+		p += w;
+		n -= (size_t)w;
+	}
+}
+
 /* Returns bytes read; short only at EOF. */
 static size_t xread(int fd, void *buf, size_t n)
 {
@@ -184,6 +201,72 @@ static void chksums(const struct tarhdr *h, unsigned *uns, int *sgn)
 /* read: list and extract						 */
 /* ===================================================================== */
 
+struct defer {			/* dir modes/times applied after the contents */
+	char *path;
+	mode_t mode;
+	time_t mtime;
+};
+static struct defer *defs;
+static size_t ndef, capdef;
+
+static void defer_dir(const char *path, mode_t mode, time_t mtime)
+{
+	if (ndef == capdef) {
+		capdef = capdef ? capdef * 2 : 32;
+		defs = realloc(defs, capdef * sizeof *defs);
+		if (!defs)
+			die("out of memory");
+	}
+	defs[ndef].path = xstrdup(path);
+	defs[ndef].mode = mode;
+	defs[ndef].mtime = mtime;
+	ndef++;
+}
+
+static void set_times(const char *path, time_t mtime)
+{
+	struct timespec ts[2];
+	ts[0].tv_sec = mtime;
+	ts[0].tv_nsec = 0;
+	ts[1] = ts[0];
+	utimensat(AT_FDCWD, path, ts, AT_SYMLINK_NOFOLLOW);
+}
+
+static void flush_defers(void)
+{
+	/* Reverse order: a parent may be mode 0500, so children must be done. */
+	for (size_t i = ndef; i-- > 0;) {
+		chmod(defs[i].path, defs[i].mode);
+		set_times(defs[i].path, defs[i].mtime);
+		free(defs[i].path);
+	}
+	ndef = 0;
+}
+
+/* Create the parent directories of `path`.  A member may name a file inside a
+ * directory the archive never stored one for, so we cannot rely on seeing a
+ * '5' member first. */
+static int ensure_dirs(const char *path)
+{
+	char *tmp = xstrdup(path);
+	int ok = 1;
+	for (char *s = tmp; *s; s++) {
+		if (*s != '/' || s == tmp)
+			continue;
+		*s = '\0';
+		if (mkdir(tmp, 0755) < 0 && errno != EEXIST) {
+			warn_("mkdir %s: %s", tmp, strerror(errno));
+			failures++;
+			ok = 0;
+		}
+		*s = '/';
+		if (!ok)
+			break;
+	}
+	free(tmp);
+	return ok;
+}
+
 static void mode_str(mode_t m, int type, char out[11])
 {
 	static const char *rwx[8] = { "---", "--x", "-w-", "-wx",
@@ -215,7 +298,38 @@ static void skip_data(uint64_t size)
 	}
 }
 
-static void do_list(void)
+static void extract_data(const char *path, uint64_t size, mode_t mode)
+{
+	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd < 0) {
+		warn_("%s: %s", path, strerror(errno));
+		failures++;
+		skip_data(size);
+		return;
+	}
+	static char buf[1 << 16];
+	uint64_t left = size;
+	while (left) {
+		size_t want = left > sizeof buf ? sizeof buf : (size_t)left;
+		if (xread(afd, buf, want) != want)
+			die("unexpected end of archive in %s", path);
+		xwrite(fd, buf, want);
+		left -= want;
+	}
+	close(fd);
+	/* shortcut: no chown/fchown.  Ceiling: tarx cannot restore a system
+	 * image -- everything lands owned by the extracting user.  Upgrade
+	 * path: attempt fchown when geteuid()==0 (or --numeric-owner is given)
+	 * and warn, not fail, on EPERM. */
+	size_t pad = (size_t)((BLK - (size % BLK)) % BLK);
+	if (pad) {
+		char junk[BLK];
+		xread(afd, junk, pad);
+	}
+	chmod(path, mode);
+}
+
+static void do_read(int extract)
 {
 	int saw_any = 0;
 
@@ -315,7 +429,7 @@ static void do_list(void)
 		while (cl > 1 && clean[cl - 1] == '/')
 			clean[--cl] = '\0';
 
-		{
+		if (!extract) {
 			if (opt_v) {
 				char ms[11];
 				mode_str((mode_t)mode, type, ms);
@@ -342,9 +456,42 @@ static void do_list(void)
 			goto next;
 		}
 
+		if (!ensure_dirs(clean)) {
+			skip_data(size);
+			goto next;
+		}
+		if (opt_v)
+			printf("%s\n", name);
+
+		switch (type) {
+		case T_DIR:
+			if (mkdir(clean, 0700) < 0 && errno != EEXIST) {
+				warn_("mkdir %s: %s", clean, strerror(errno));
+				failures++;
+				break;
+			}
+			defer_dir(clean, (mode_t)(mode & 07777), (time_t)mtime);
+			break;
+		case T_REG:
+		case T_CONT:
+			extract_data(clean, size, (mode_t)(mode & 07777));
+			set_times(clean, (time_t)mtime);
+			break;
+		default:
+			/* shortcut: only files and directories are created so
+			 * far.  Ceiling: a tree with a symlink, a hard link or
+			 * a FIFO extracts incomplete.  Upgrade path: the three
+			 * cases are one syscall each -- the very next commit. */
+			warn_("%s: typeflag '%c' not extracted yet", name, type);
+			skip_data(size);
+			break;
+		}
+
  next:
 		free(clean);
 	}
+	if (extract)
+		flush_defers();
 }
 
 /* ===================================================================== */
@@ -409,9 +556,7 @@ int main(int argc, char **argv)
 
 	if (mode == 'c')
 		die("-c is not implemented yet");
-	if (mode == 'x')
-		die("-x is not implemented yet");
-	do_list();
+	do_read(mode == 'x');
 
 	if (afd > 2)
 		close(afd);
