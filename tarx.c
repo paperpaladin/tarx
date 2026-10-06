@@ -93,6 +93,14 @@ static void warn_(const char *fmt, ...)
 	fputc('\n', stderr);
 }
 
+/* A refused member is a successful refusal, but the run must still fail loudly
+ * so callers (and the test harness) can tell extraction was not complete. */
+static void refuse(const char *path, const char *why)
+{
+	fprintf(stderr, "%s: REFUSING unsafe member %s: %s\n", prog, path, why);
+	failures++;
+}
+
 static void *xmalloc(size_t n)
 {
 	void *p = malloc(n ? n : 1);
@@ -225,6 +233,80 @@ static void chksums(const struct tarhdr *h, unsigned *uns, int *sgn)
 	}
 	*uns = u;
 	*sgn = s;
+}
+
+/* ---------------------------------------------------------- path handling */
+
+/* Lexical rejection: an absolute path, or any ".." component, can only be an
+ * attempt to write outside the destination.  There is no legitimate archive
+ * that needs either, so we refuse instead of sanitising -- silently rewriting
+ * paths is how extractors end up surprising people. */
+static const char *path_unsafe(const char *p)
+{
+	if (!*p)
+		return "empty name";
+	if (p[0] == '/')
+		return "absolute path";
+	for (const char *s = p;;) {
+		const char *e = strchr(s, '/');
+		size_t n = e ? (size_t)(e - s) : strlen(s);
+		if (n == 2 && s[0] == '.' && s[1] == '.')
+			return "contains a \"..\" component";
+		if (!e)
+			break;
+		s = e + 1;
+	}
+	return NULL;
+}
+
+/* Number of real directory components above the member itself. */
+static int dir_depth(const char *p)
+{
+	int d = 0;
+	for (const char *s = p;;) {
+		const char *e = strchr(s, '/');
+		if (!e)
+			break;
+		size_t n = (size_t)(e - s);
+		if (n && !(n == 1 && s[0] == '.'))
+			d++;
+		s = e + 1;
+	}
+	return d;
+}
+
+/* A symlink is a stored path, so it can point anywhere -- including out of the
+ * destination -- without any ".." appearing in the *member* name.  Walk the
+ * target relative to the link's own directory and refuse if it ever climbs
+ * above the extraction root.
+ *
+ * shortcut: this is a purely lexical analysis, backed up by an lstat on every
+ * parent component at write time.  Ceiling: TOCTOU -- a process racing us
+ * inside the destination could swap a directory for a symlink between our
+ * lstat and our open.  Upgrade path: hold an O_PATH fd on the destination and
+ * do every create with openat/mkdirat/symlinkat relative to it, which makes
+ * escape structurally impossible instead of merely checked. */
+static const char *link_escapes(const char *linkpath, const char *target)
+{
+	if (!*target)
+		return "empty link target";
+	if (target[0] == '/')
+		return "absolute link target";
+	int depth = dir_depth(linkpath);
+	for (const char *s = target;;) {
+		const char *e = strchr(s, '/');
+		size_t n = e ? (size_t)(e - s) : strlen(s);
+		if (n == 2 && s[0] == '.' && s[1] == '.') {
+			if (--depth < 0)
+				return "link target escapes destination";
+		} else if (n && !(n == 1 && s[0] == '.')) {
+			depth++;
+		}
+		if (!e)
+			break;
+		s = e + 1;
+	}
+	return NULL;
 }
 
 /* ustar splits a path over prefix[155] + '/' + name[100].  The split must land
@@ -609,9 +691,10 @@ static void flush_defers(void)
 	ndef = 0;
 }
 
-/* Create the parent directories of `path`.  A member may name a file inside a
- * directory the archive never stored one for, so we cannot rely on seeing a
- * '5' member first. */
+/* Create the parent directories of `path`, refusing to walk through an
+ * existing symlink.  Without this check a two-member archive wins: member one
+ * is the symlink "a" -> "/tmp", member two is the plain file "a/b", and every
+ * purely lexical path check in the world passes it. */
 static int ensure_dirs(const char *path)
 {
 	char *tmp = xstrdup(path);
@@ -620,7 +703,16 @@ static int ensure_dirs(const char *path)
 		if (*s != '/' || s == tmp)
 			continue;
 		*s = '\0';
-		if (mkdir(tmp, 0755) < 0 && errno != EEXIST) {
+		struct stat st;
+		if (lstat(tmp, &st) == 0) {
+			if (S_ISLNK(st.st_mode)) {
+				refuse(path, "parent component is a symlink");
+				ok = 0;
+			} else if (!S_ISDIR(st.st_mode)) {
+				refuse(path, "parent component is not a directory");
+				ok = 0;
+			}
+		} else if (mkdir(tmp, 0755) < 0 && errno != EEXIST) {
 			warn_("mkdir %s: %s", tmp, strerror(errno));
 			failures++;
 			ok = 0;
@@ -730,7 +822,14 @@ static void skip_data(uint64_t size)
 
 static void extract_data(const char *path, uint64_t size, mode_t mode)
 {
-	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	/* unlink() does not follow symlinks, so this both gives overwrite
+	 * semantics and guarantees the O_EXCL open below cannot be aimed
+	 * through a pre-existing link.  O_NOFOLLOW is belt and braces. */
+	if (unlink(path) < 0 && errno != ENOENT && errno != EISDIR) {
+		warn_("unlink %s: %s", path, strerror(errno));
+		failures++;
+	}
+	int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
 	if (fd < 0) {
 		warn_("%s: %s", path, strerror(errno));
 		failures++;
@@ -900,6 +999,20 @@ static void do_read(int extract)
 			goto next;
 		}
 
+		/* ---- extraction: every path check happens here ---- */
+		const char *bad = path_unsafe(clean);
+		if (bad) {
+			refuse(name, bad);
+			skip_data(size);
+			goto next;
+		}
+		if ((type == T_SYM || type == T_LNK) &&
+		    (bad = type == T_SYM ? link_escapes(clean, lname)
+		     : path_unsafe(lname))) {
+			refuse(name, bad);
+			skip_data(size);
+			goto next;
+		}
 		if (!ensure_dirs(clean)) {
 			skip_data(size);
 			goto next;
@@ -914,6 +1027,13 @@ static void do_read(int extract)
 				failures++;
 				break;
 			}
+			{
+				struct stat st;
+				if (lstat(clean, &st) == 0 && S_ISLNK(st.st_mode)) {
+					refuse(name, "existing path is a symlink");
+					break;
+				}
+			}
 			defer_dir(clean, (mode_t)(mode & 07777), (time_t)mtime);
 			break;
 		case T_REG:
@@ -922,7 +1042,7 @@ static void do_read(int extract)
 			set_times(clean, (time_t)mtime);
 			break;
 		case T_SYM:
-			(void)unlink(clean);	/* overwrite */
+			(void)unlink(clean);	/* overwrite; symlink() reports real errors */
 			if (symlink(lname, clean) < 0) {
 				warn_("symlink %s: %s", clean, strerror(errno));
 				failures++;
