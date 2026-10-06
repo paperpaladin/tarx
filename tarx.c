@@ -477,12 +477,41 @@ static void do_read(int extract)
 			extract_data(clean, size, (mode_t)(mode & 07777));
 			set_times(clean, (time_t)mtime);
 			break;
+		case T_SYM:
+			(void)unlink(clean);	/* overwrite */
+			if (symlink(lname, clean) < 0) {
+				warn_("symlink %s: %s", clean, strerror(errno));
+				failures++;
+			} else {
+				set_times(clean, (time_t)mtime);
+			}
+			break;
+		case T_LNK:
+			(void)unlink(clean);
+			/* On Linux link() does not resolve a symlinked target,
+			 * so a hostile "link to a-symlink-to-/etc/passwd" gets
+			 * a link to the symlink, not to the file. */
+			if (link(lname, clean) < 0) {
+				warn_("link %s -> %s: %s", clean, lname,
+				      strerror(errno));
+				failures++;
+			}
+			break;
+		case T_FIFO:
+			if (mkfifo(clean, (mode_t)(mode & 07777)) < 0) {
+				warn_("mkfifo %s: %s", clean, strerror(errno));
+				failures++;
+			} else {
+				set_times(clean, (time_t)mtime);
+			}
+			break;
 		default:
-			/* shortcut: only files and directories are created so
-			 * far.  Ceiling: a tree with a symlink, a hard link or
-			 * a FIFO extracts incomplete.  Upgrade path: the three
-			 * cases are one syscall each -- the very next commit. */
-			warn_("%s: typeflag '%c' not extracted yet", name, type);
+			/* shortcut: device nodes are listed but not created --
+			 * mknod needs root and an unprivileged extractor that
+			 * silently skips is friendlier than one that fails.
+			 * Ceiling: no /dev restores.  Upgrade: attempt mknod
+			 * and only warn on EPERM. */
+			warn_("%s: typeflag '%c' not extracted", name, type);
 			skip_data(size);
 			break;
 		}
