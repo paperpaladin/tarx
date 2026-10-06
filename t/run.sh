@@ -375,6 +375,42 @@ assert "pre-existing symlink case still refuses loudly" \
 	sh -c "'$TARX' -xf '$TMP/evil/through_existing.tar' -C '$TMP/jail/pre/dest' 2>&1 | grep -q REFUSING"
 
 # ===================================================================== #
+# 8. hostile / malformed input must not crash                           #
+# ===================================================================== #
+head -c 300 "$TMP/x.tar" >"$TMP/trunc_hdr.tar"
+head -c 2000 "$TMP/x.tar" >"$TMP/trunc_mid.tar"
+head -c 4096 /dev/urandom >"$TMP/random.tar"
+: >"$TMP/zero.tar"
+for bad in trunc_hdr trunc_mid random zero; do
+	"$TARX" -tf "$TMP/$bad.tar" >/dev/null 2>&1
+	rc=$?
+	if [ "$rc" -lt 128 ]; then
+		ok "malformed[$bad]: exits cleanly (rc=$rc), no signal"
+	else
+		no "malformed[$bad]: died with signal (rc=$rc)"
+	fi
+done
+
+# A thousand single-byte mutations of a real archive: the header parser must
+# never fault.  Cheap stand-in for the real fuzzer in PLAN.md.
+python3 - "$TMP" "$TARX" <<'PY' && ok "1000 mutated archives: no crashes" || no "1000 mutated archives: crashed"
+import random, subprocess, sys
+tmp, tarx = sys.argv[1], sys.argv[2]
+base = bytearray(open(tmp + '/x.tar', 'rb').read()[:60 * 512])
+random.seed(1)
+bad = []
+for i in range(1000):
+    m = bytearray(base)
+    for _ in range(random.randint(1, 4)):
+        m[random.randrange(len(m))] = random.randrange(256)
+    p = subprocess.run([tarx, '-tvf', '-'], input=bytes(m),
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if p.returncode < 0 or p.returncode >= 128:
+        bad.append((i, p.returncode))
+assert not bad, bad[:5]
+PY
+
+# ===================================================================== #
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

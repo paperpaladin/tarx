@@ -14,8 +14,15 @@ tarx: tarx.c
 test: tarx
 	@t/run.sh
 
+# We parse untrusted archive bytes, so the sanitiser build is the one that
+# matters most; the harness runs identically against it.
+test-asan: clean
+	$(CC) -std=c11 -g -O1 -Wall -Wextra -Wno-unused-parameter $(CPPFLAGS) \
+		-fsanitize=address,undefined -fno-omit-frame-pointer -o tarx tarx.c
+	@TARX_SKIP_BIG=1 t/run.sh
+
 clean:
 	rm -f tarx
 	rm -rf t/tmp
 
-.PHONY: all test clean
+.PHONY: all test test-asan clean
