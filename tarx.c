@@ -111,8 +111,6 @@ static char *xstrdup(const char *s)
 
 /* ---------------------------------------------------------------- raw I/O */
 
-/* shortcut: unused until -c exists; xwrite is here because extract_data needs
- * it too and one short-write loop is enough for both. */
 static void xwrite(int fd, const void *buf, size_t n)
 {
 	const char *p = buf;
@@ -151,7 +149,28 @@ static size_t xread(int fd, void *buf, size_t n)
 
 /* ustar stores numbers as right-aligned zero-padded octal ASCII with a NUL (or
  * space) terminator, so an n-byte field holds at most 8^(n-1)-1: the 12-byte
- * size field tops out at 8589934591, i.e. 8 GiB - 1. */
+ * size field tops out at 8589934591, i.e. 8 GiB - 1.
+ *
+ * shortcut: a value that does not fit is clamped with a warning.  Ceiling: any
+ * member over 8 GiB - 1 bytes.  Upgrade path: base-256 encoding, which the
+ * reader already understands -- the very next commit. */
+static void put_num(char *p, size_t n, uint64_t v)
+{
+	uint64_t max = ((uint64_t)1 << (3 * (n - 1))) - 1;
+	char tmp[32];
+
+	if (v > max) {
+		warn_("value %llu does not fit an octal field, clamped",
+		      (unsigned long long)v);
+		failures++;
+		v = max;
+	}
+	snprintf(tmp, sizeof tmp, "%0*llo", (int)(n - 1),
+		 (unsigned long long)v);
+	memcpy(p, tmp, n - 1);
+	p[n - 1] = '\0';
+}
+
 static int get_num(const char *p, size_t n, uint64_t *out)
 {
 	const unsigned char *u = (const unsigned char *)p;
@@ -206,6 +225,271 @@ static void chksums(const struct tarhdr *h, unsigned *uns, int *sgn)
 	}
 	*uns = u;
 	*sgn = s;
+}
+
+/* shortcut: paths over 100 bytes are truncated with a warning.  Ceiling: any
+ * real source tree.  Upgrade path: the ustar prefix/name split and a pax
+ * extended header, which is the very next commit. */
+static int split_name(const char *p, char *name, char *prefix)
+{
+	size_t len = strlen(p);
+
+	memset(name, 0, 100);
+	memset(prefix, 0, 155);
+	if (len > 100) {
+		warn_("%s: path over 100 bytes, truncated", p);
+		failures++;
+		len = 100;
+	}
+	memcpy(name, p, len);
+	return 0;
+}
+
+/* ===================================================================== */
+/* create								 */
+/* ===================================================================== */
+
+struct hl {			/* seen hard-linkable inodes */
+	dev_t dev;
+	ino_t ino;
+	char *name;
+};
+static struct hl *hls;
+static size_t nhl, caphl;
+
+static void pad_to_block(uint64_t written)
+{
+	static const char zeros[BLK];
+	size_t r = (size_t)(written % BLK);
+	if (r)
+		xwrite(afd, zeros, BLK - r);
+}
+
+static void finish_header(struct tarhdr *h)
+{
+	unsigned u;
+	int s;
+	memcpy(h->magic, "ustar", 6);
+	memcpy(h->version, "00", 2);
+	memset(h->chksum, ' ', 8);
+	chksums(h, &u, &s);
+	/* GNU writes six octal digits, NUL, space.  Everything reads that. */
+	char tmp[8];
+	snprintf(tmp, sizeof tmp, "%06o", u & 0777777);
+	memcpy(h->chksum, tmp, 7);
+	h->chksum[7] = ' ';
+	xwrite(afd, h, BLK);
+}
+
+static void write_member(const char *path, const struct stat *st, int type,
+			 const char *link, uint64_t size)
+{
+	struct tarhdr h;
+	char name[100], prefix[155];
+
+	split_name(path, name, prefix);
+	if (link && strlen(link) > 100) {
+		warn_("%s: link target over 100 bytes, truncated", path);
+		failures++;
+	}
+	memset(&h, 0, sizeof h);
+	memcpy(h.name, name, 100);
+	memcpy(h.prefix, prefix, 155);
+	put_num(h.mode, 8, (uint64_t)(st->st_mode & 07777));
+	put_num(h.uid, 8, (uint64_t)st->st_uid);
+	put_num(h.gid, 8, (uint64_t)st->st_gid);
+	put_num(h.size, 12, size);
+	/* Pre-epoch mtimes would need the negative base-256 form; clamp. */
+	put_num(h.mtime, 12, st->st_mtime < 0 ? 0 : (uint64_t)st->st_mtime);
+	h.typeflag = (char)type;
+	if (link)
+		memcpy(h.linkname, link, strlen(link) > 100 ? 100 : strlen(link));
+
+	struct passwd *pw = getpwuid(st->st_uid);
+	struct group *gr = getgrgid(st->st_gid);
+	if (pw)
+		snprintf(h.uname, sizeof h.uname, "%s", pw->pw_name);
+	if (gr)
+		snprintf(h.gname, sizeof h.gname, "%s", gr->gr_name);
+	if (type == T_CHR || type == T_BLK) {
+		put_num(h.devmajor, 8, (uint64_t)major(st->st_rdev));
+		put_num(h.devminor, 8, (uint64_t)minor(st->st_rdev));
+	}
+	finish_header(&h);
+}
+
+static void copy_file_data(const char *path, uint64_t size)
+{
+	int fd = open(path, O_RDONLY);
+	if (fd < 0) {
+		warn_("%s: %s", path, strerror(errno));
+		/* Header already promised `size` bytes; keep the stream valid. */
+		failures++;
+	}
+	/* shortcut: a plain 64 KiB read/write loop -- no copy_file_range, no
+	 * SEEK_HOLE probing, so a sparse 9 GiB file becomes 9 GiB of literal
+	 * zeros in the archive.  Ceiling: archiving VM images or DB files is
+	 * absurdly wasteful.  Upgrade path: GNU/pax sparse members, which needs
+	 * a format change, not just an I/O change -- see PLAN.md Milestone 1. */
+	static char buf[1 << 16];
+	uint64_t left = size;
+	while (left) {
+		size_t want = left > sizeof buf ? sizeof buf : (size_t)left;
+		size_t got = fd < 0 ? 0 : xread(fd, buf, want);
+		if (got < want) {
+			memset(buf + got, 0, want - got);
+			if (fd >= 0) {
+				warn_("%s: file shrank while reading, padding", path);
+				failures++;
+				close(fd);
+				fd = -1;
+			}
+		}
+		xwrite(afd, buf, want);
+		left -= want;
+	}
+	if (fd >= 0)
+		close(fd);
+	pad_to_block(size);
+}
+
+static void add_path(const char *path);
+
+static void add_dir(const char *path)
+{
+	DIR *d = opendir(path);
+	if (!d) {
+		warn_("%s: %s", path, strerror(errno));
+		failures++;
+		return;
+	}
+	/* Collect and sort so archives are reproducible; readdir order is not. */
+	char **names = NULL;
+	size_t n = 0, cap = 0;
+	struct dirent *de;
+	while ((de = readdir(d))) {
+		if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+			continue;
+		if (n == cap) {
+			cap = cap ? cap * 2 : 16;
+			names = realloc(names, cap * sizeof *names);
+			if (!names)
+				die("out of memory");
+		}
+		names[n++] = xstrdup(de->d_name);
+	}
+	closedir(d);
+	/* shortcut: insertion sort, O(n^2).  Ceiling: a directory with ~100k
+	 * entries starts to drag.  Upgrade path: qsort(3) with a strcmp
+	 * comparator -- one line, done the day someone notices. */
+	for (size_t i = 0; i < n; i++)
+		for (size_t j = i; j && strcmp(names[j - 1], names[j]) > 0; j--) {
+			char *t = names[j - 1];
+			names[j - 1] = names[j];
+			names[j] = t;
+		}
+	size_t pl = strlen(path);
+	int slash = pl && path[pl - 1] == '/';
+	for (size_t i = 0; i < n; i++) {
+		char *sub = xmalloc(pl + strlen(names[i]) + 2);
+		sprintf(sub, "%s%s%s", path, slash ? "" : "/", names[i]);
+		add_path(sub);
+		free(sub);
+		free(names[i]);
+	}
+	free(names);
+}
+
+static void add_path(const char *path)
+{
+	struct stat st;
+	if (lstat(path, &st) < 0) {
+		warn_("%s: %s", path, strerror(errno));
+		failures++;
+		return;
+	}
+
+	/* Hard links: the second and later names for an inode become type '1'
+	 * members whose linkname is the first name we stored. */
+	if (!S_ISDIR(st.st_mode) && st.st_nlink > 1) {
+		for (size_t i = 0; i < nhl; i++)
+			if (hls[i].dev == st.st_dev && hls[i].ino == st.st_ino) {
+				if (opt_v)
+					printf("%s link to %s\n", path, hls[i].name);
+				write_member(path, &st, T_LNK, hls[i].name, 0);
+				return;
+			}
+		if (nhl == caphl) {
+			caphl = caphl ? caphl * 2 : 32;
+			hls = realloc(hls, caphl * sizeof *hls);
+			if (!hls)
+				die("out of memory");
+		}
+		hls[nhl].dev = st.st_dev;
+		hls[nhl].ino = st.st_ino;
+		hls[nhl].name = xstrdup(path);
+		nhl++;
+	}
+
+	if (opt_v)
+		printf("%s%s\n", path, S_ISDIR(st.st_mode) ? "/" : "");
+
+	if (S_ISDIR(st.st_mode)) {
+		/* Directory members carry a trailing '/' by convention; some
+		 * readers rely on it to tell a dir from a zero-length file. */
+		size_t l = strlen(path);
+		char *p = xmalloc(l + 2);
+		memcpy(p, path, l);
+		if (l && path[l - 1] != '/')
+			p[l++] = '/';
+		p[l] = '\0';
+		write_member(p, &st, T_DIR, NULL, 0);
+		free(p);
+		add_dir(path);
+	} else if (S_ISLNK(st.st_mode)) {
+		char tgt[PATH_MAX];
+		ssize_t r = readlink(path, tgt, sizeof tgt - 1);
+		if (r < 0) {
+			warn_("%s: %s", path, strerror(errno));
+			failures++;
+			return;
+		}
+		tgt[r] = '\0';
+		write_member(path, &st, T_SYM, tgt, 0);
+	} else if (S_ISREG(st.st_mode)) {
+		write_member(path, &st, T_REG, NULL, (uint64_t)st.st_size);
+		copy_file_data(path, (uint64_t)st.st_size);
+	} else if (S_ISFIFO(st.st_mode)) {
+		write_member(path, &st, T_FIFO, NULL, 0);
+	} else if (S_ISCHR(st.st_mode)) {
+		write_member(path, &st, T_CHR, NULL, 0);
+	} else if (S_ISBLK(st.st_mode)) {
+		write_member(path, &st, T_BLK, NULL, 0);
+	} else {
+		warn_("%s: unsupported file type, skipped", path);
+		failures++;
+	}
+}
+
+static void do_create(int argc, char **argv)
+{
+	static const char zeros[BLK];
+	if (argc == 0)
+		die("create: no input paths");
+	for (int i = 0; i < argc; i++) {
+		/* Strip trailing slashes so member names stay canonical. */
+		char *p = xstrdup(argv[i]);
+		size_t l = strlen(p);
+		while (l > 1 && p[l - 1] == '/')
+			p[--l] = '\0';
+		add_path(p);
+		free(p);
+	}
+	/* An archive ends with two 512-byte zero blocks.  One is ambiguous with
+	 * a corrupt header; two is the agreed end-of-archive marker, and real
+	 * tars often pad further to the blocking factor (we do not). */
+	xwrite(afd, zeros, BLK);
+	xwrite(afd, zeros, BLK);
 }
 
 /* ===================================================================== */
@@ -678,8 +962,9 @@ int main(int argc, char **argv)
 		die("chdir %s: %s", dir, strerror(errno));
 
 	if (mode == 'c')
-		die("-c is not implemented yet");
-	do_read(mode == 'x');
+		do_create(argc - optind, argv + optind);
+	else
+		do_read(mode == 'x');
 
 	if (afd > 2)
 		close(afd);
