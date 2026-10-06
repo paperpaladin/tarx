@@ -155,14 +155,21 @@ static size_t xread(int fd, void *buf, size_t n)
 static int get_num(const char *p, size_t n, uint64_t *out)
 {
 	const unsigned char *u = (const unsigned char *)p;
+
+	if (u[0] & 0x80) {
+		uint64_t v = 0;
+		if (u[0] != 0x80)	/* negative / >2^(8n-8): not a size we handle */
+			return -1;
+		for (size_t i = 1; i < n; i++) {
+			if (v > (UINT64_MAX >> 8))
+				return -1;
+			v = (v << 8) | u[i];
+		}
+		*out = v;
+		return 0;
+	}
+
 	uint64_t v = 0;
-
-	/* shortcut: bit 7 of byte 0 marks a base-256 field; we reject it for
-	 * now.  Ceiling: any member over 8 GiB - 1 bytes is unreadable.
-	 * Upgrade path: decode it, which is the very next commit. */
-	if (u[0] & 0x80)
-		return -1;
-
 	size_t i = 0;
 	while (i < n && (u[i] == ' ' || u[i] == '\0'))
 		i++;
