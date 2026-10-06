@@ -150,6 +150,49 @@ assert "tarx->GNU->tarx triple hop extracts" "$TARX" -xf "$TMP/mid.tar" -C "$TMP
 assert "tarx->GNU->tarx: diff -r byte-identical" diff -r "$TMP/tree" "$TMP/rt2/tree"
 
 # ===================================================================== #
+# 4. long-path encodings: prefix split vs pax                           #
+# ===================================================================== #
+# The splittable 150-byte path must go in prefix+name with NO pax header; the
+# unsplittable one must produce one.  Checked by reading the raw header bytes,
+# because "it extracted fine" would pass either way.
+python3 - "$TMP/x.tar" <<'PY' && ok "long paths use the right encodings" || no "long paths use the right encodings"
+import sys
+data = open(sys.argv[1], 'rb').read()
+split_seen = pax_seen = False
+off = 0
+while off + 512 <= len(data):
+    h = data[off:off+512]
+    if h == b'\0'*512:
+        break
+    name = h[0:100].split(b'\0')[0].decode()
+    prefix = h[345:500].split(b'\0')[0].decode()
+    typ = chr(h[156])
+    size = int(h[124:136].split(b'\0')[0].strip() or b'0', 8)
+    if typ == 'x':
+        body = data[off+512:off+512+size].decode()
+        if ' path=' in body:
+            pax_seen = True
+    if prefix and 's'*25 in name:
+        split_seen = True
+        assert len(prefix) <= 155 and len(name) <= 100
+        assert len(prefix + '/' + name) == len('tree/' + 'split/'*20 + 's'*25)
+    off += 512 + (size + 511) // 512 * 512
+assert split_seen, "no ustar prefix/name split emitted"
+assert pax_seen, "no pax extended header path= emitted"
+PY
+
+# ===================================================================== #
+# 5. end-of-archive: exactly two zero blocks                            #
+# ===================================================================== #
+python3 - "$TMP/x.tar" <<'PY' && ok "archive ends with two 512-byte zero blocks" || no "archive ends with two 512-byte zero blocks"
+import sys
+d = open(sys.argv[1], 'rb').read()
+assert len(d) % 512 == 0, len(d)
+assert d[-1024:] == b'\0' * 1024
+assert d[-1536:-1024] != b'\0' * 512, "more than two trailing zero blocks"
+PY
+
+# ===================================================================== #
 # 6. base-256 size encoding: a 9 GiB member                             #
 # ===================================================================== #
 BIGSZ=9663676416
