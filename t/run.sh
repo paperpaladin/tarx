@@ -223,6 +223,158 @@ else
 fi
 
 # ===================================================================== #
+# 7. SECURITY: path traversal must be REFUSED, not sanitised            #
+# ===================================================================== #
+# Each case extracts into $TMP/jail/dest and then proves (a) tarx exited
+# nonzero, (b) the payload is not inside dest, and (c) nothing at all appeared
+# beside dest -- i.e. nothing escaped.
+
+# Hand-written headers, because GNU tar will not emit several of these.
+cat >"$TMP/mkevil.py" <<'PY'
+import sys, os
+
+def hdr(name, typ='0', size=0, link='', mode=0o644, prefix=''):
+    h = bytearray(512)
+    def put(off, s, n):
+        b = s.encode() if isinstance(s, str) else s
+        assert len(b) <= n, (off, len(b), n)
+        h[off:off+len(b)] = b
+    put(0, name, 100)
+    put(100, '%07o\0' % mode, 8)
+    put(108, '%07o\0' % 0, 8)
+    put(116, '%07o\0' % 0, 8)
+    put(124, '%011o\0' % size, 12)
+    put(136, '%011o\0' % 0, 12)
+    h[148:156] = b' ' * 8           # checksum computed over spaces, see tarx.c
+    h[156] = ord(typ)
+    put(157, link, 100)
+    put(257, 'ustar\0', 6)
+    put(263, '00', 2)
+    put(345, prefix, 155)
+    put(148, '%06o\0 ' % sum(h), 8)
+    return bytes(h)
+
+def body(b):
+    return b + b'\0' * (-len(b) % 512)
+
+def member(name, typ='0', content=b'', link='', mode=0o644, prefix=''):
+    return hdr(name, typ, len(content), link, mode, prefix) + body(content)
+
+def pax(records, then):
+    recs = b''
+    for k, v in records:
+        base = len(k) + len(v) + 3
+        n = base
+        while True:
+            m = base + len(str(n))
+            if m == n:
+                break
+            n = m
+        recs += b'%d %s=%s\n' % (n, k.encode(), v.encode())
+    return hdr('PaxHeaders/x', 'x', len(recs)) + body(recs) + then
+
+PAYLOAD = b'PWNED\n'
+cases = {
+  # name                     archive bytes
+  'dotdot':      member('../escape', content=PAYLOAD),
+  'dotdot_deep': member('dest/../../escape', content=PAYLOAD),
+  'absolute':    member('/tmp/tarx-should-never-write-this', content=PAYLOAD),
+  'abs_prefix':  member('escape', content=PAYLOAD, prefix='/tmp'),
+  'symabs':      member('link', '2', link='/tmp/tarx-should-never-write-this'),
+  'symesc':      member('link', '2', link='../../escape'),
+  'symdeep':     member('d/link', '2', link='../../escape'),
+  'hardesc':     member('h', '1', link='../escape'),
+  # the member name is clean; the malicious path arrives via pax
+  'pax_dotdot':  pax([('path', '../escape')], member('placeholder', content=PAYLOAD)),
+  'pax_abs':     pax([('path', '/tmp/tarx-should-never-write-this')],
+                     member('placeholder', content=PAYLOAD)),
+  # GNU 'L' long-name delivery of the same thing
+  'gnu_dotdot':  (hdr('././@LongLink', 'L', len('../escape') + 1) +
+                  body(b'../escape\0') + member('placeholder', content=PAYLOAD)),
+  # two members: a legal symlink, then a file "through" it.  Purely lexical
+  # checks pass this; only an lstat on each parent component catches it.
+  'via_symlink': (member('sub/', '5', mode=0o755) +
+                  member('sub/up', '2', link='..') +
+                  member('sub/up/escape', content=PAYLOAD)),
+  # a bad member sandwiched between good ones: refusal is per-member, the
+  # good members must still land
+  'mixed':       (member('good.txt', content=b'fine\n') +
+                  member('../escape', content=PAYLOAD) +
+                  member('also-good.txt', content=b'fine\n')),
+}
+# Not a refusal case on its own -- "link/escape" is perfectly legal into an
+# empty destination.  It only turns hostile when "link" already exists as a
+# symlink, which the harness sets up separately.
+extras = {
+  'through_existing': member('link/escape', content=PAYLOAD),
+}
+out = sys.argv[1]
+os.makedirs(out, exist_ok=True)
+for k, v in list(cases.items()) + list(extras.items()):
+    open(os.path.join(out, k + '.tar'), 'wb').write(v + b'\0' * 1024)
+print('\n'.join(sorted(cases)))
+PY
+EVILS=$(python3 "$TMP/mkevil.py" "$TMP/evil")
+
+# GNU tar, with -P, happily writes the two classic cases -- so we also test
+# archives produced by the oracle itself, not only our hand-rolled bytes.
+mkdir -p "$TMP/src" && echo PWNED >"$TMP/src/escape"
+"$GNUTAR" -P -cf "$TMP/evil/gnu_dotdot_real.tar" --transform='s|.*|../escape|' \
+	-C "$TMP/src" escape 2>/dev/null
+"$GNUTAR" -P -cf "$TMP/evil/gnu_absolute_real.tar" \
+	--transform='s|.*|/tmp/tarx-should-never-write-this|' \
+	-C "$TMP/src" escape 2>/dev/null
+assert "GNU tar -P really stored '../escape' (oracle sanity)" \
+	sh -c "'$GNUTAR' -tf '$TMP/evil/gnu_dotdot_real.tar' | grep -q '\\.\\./escape'"
+assert "GNU tar -P really stored an absolute path (oracle sanity)" \
+	sh -c "'$GNUTAR' -tf '$TMP/evil/gnu_absolute_real.tar' | grep -qx '/tmp/tarx-should-never-write-this'"
+EVILS="$EVILS gnu_dotdot_real gnu_absolute_real"
+
+CANARY=/tmp/tarx-should-never-write-this
+rm -f "$CANARY"
+for ev in $EVILS; do
+	jail=$TMP/jail/$ev
+	rm -rf "$jail"
+	mkdir -p "$jail/dest"
+	out=$("$TARX" -xvf "$TMP/evil/$ev.tar" -C "$jail/dest" 2>&1)
+	rc=$?
+
+	# (a) refusal is loud and the exit status is nonzero
+	if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q REFUSING; then
+		ok "refuse[$ev]: nonzero exit and a REFUSING message"
+	else
+		no "refuse[$ev]: rc=$rc out=$(printf '%s' "$out" | tr '\n' ';')"
+	fi
+
+	# (b) nothing appeared next to dest, i.e. nothing escaped the destination
+	stray=$(cd "$jail" && find . -mindepth 1 -maxdepth 1 ! -name dest)
+	eq "refuse[$ev]: nothing written beside the destination" "$stray" ""
+
+	# (c) and nothing with the payload landed anywhere under the jail
+	hits=$(grep -rl PWNED "$jail" 2>/dev/null | tr '\n' ' ')
+	eq "refuse[$ev]: payload never written" "$hits" ""
+done
+refute "the absolute-path canary $CANARY was never created" test -e "$CANARY"
+
+# The refusal must be per-member, not fatal: in the mixed archive extracted by
+# the loop above, the good members must have landed anyway.
+assert "mixed archive: safe member before the bad one extracted" \
+	test -f "$TMP/jail/mixed/dest/good.txt"
+assert "mixed archive: safe member after the bad one extracted" \
+	test -f "$TMP/jail/mixed/dest/also-good.txt"
+
+# Refusal must not depend on the destination being empty: an existing symlink
+# inside the destination must not be written through, even though the member
+# name "link/escape" contains nothing suspicious at all.
+rm -rf "$TMP/jail/pre"; mkdir -p "$TMP/jail/pre/dest" "$TMP/jail/pre/outside"
+ln -s ../outside "$TMP/jail/pre/dest/link"
+"$TARX" -xf "$TMP/evil/through_existing.tar" -C "$TMP/jail/pre/dest" >/dev/null 2>&1
+refute "pre-existing symlink in dest is not written through" \
+	test -e "$TMP/jail/pre/outside/escape"
+assert "pre-existing symlink case still refuses loudly" \
+	sh -c "'$TARX' -xf '$TMP/evil/through_existing.tar' -C '$TMP/jail/pre/dest' 2>&1 | grep -q REFUSING"
+
+# ===================================================================== #
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]
