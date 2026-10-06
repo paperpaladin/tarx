@@ -227,22 +227,31 @@ static void chksums(const struct tarhdr *h, unsigned *uns, int *sgn)
 	*sgn = s;
 }
 
-/* shortcut: paths over 100 bytes are truncated with a warning.  Ceiling: any
- * real source tree.  Upgrade path: the ustar prefix/name split and a pax
- * extended header, which is the very next commit. */
+/* ustar splits a path over prefix[155] + '/' + name[100].  The split must land
+ * exactly on a '/', neither half may be empty, and the reader rejoins with a
+ * single '/'.  So a 150-byte path whose only slash is at byte 2 fits, and one
+ * with no slash in the legal window does not fit at all -- which is precisely
+ * the gap pax extended headers were invented to close. */
 static int split_name(const char *p, char *name, char *prefix)
 {
 	size_t len = strlen(p);
 
 	memset(name, 0, 100);
 	memset(prefix, 0, 155);
-	if (len > 100) {
-		warn_("%s: path over 100 bytes, truncated", p);
-		failures++;
-		len = 100;
+	if (len <= 100) {
+		memcpy(name, p, len);
+		return 0;
 	}
-	memcpy(name, p, len);
-	return 0;
+	size_t lo = len > 101 ? len - 101 : 1;
+	size_t hi = len - 2 < 155 ? len - 2 : 155;
+	for (size_t i = lo; i <= hi; i++) {
+		if (p[i] != '/')
+			continue;
+		memcpy(prefix, p, i);
+		memcpy(name, p + i + 1, len - i - 1);
+		return 0;
+	}
+	return -1;		/* caller must emit a pax header */
 }
 
 /* ===================================================================== */
@@ -256,6 +265,7 @@ struct hl {			/* seen hard-linkable inodes */
 };
 static struct hl *hls;
 static size_t nhl, caphl;
+static unsigned pax_seq;
 
 static void pad_to_block(uint64_t written)
 {
@@ -281,17 +291,78 @@ static void finish_header(struct tarhdr *h)
 	xwrite(afd, h, BLK);
 }
 
+/* Emit a pax extended header member carrying one or more "key=value" records
+ * for the member that follows it. */
+static void write_pax(const char *forname, const char *path, const char *link)
+{
+	char *buf = NULL;
+	size_t len = 0, cap = 0;
+
+	const char *keys[2] = { "path", "linkpath" };
+	const char *vals[2] = { path, link };
+
+	for (int k = 0; k < 2; k++) {
+		if (!vals[k])
+			continue;
+		/* A pax record is "<len> <key>=<value>\n" where <len> counts
+		 * the length field itself, so it is self-referential: grow the
+		 * digit count until it stops changing. */
+		size_t body = strlen(keys[k]) + 1 + strlen(vals[k]) + 2; /* " k=v\n" minus digits */
+		size_t total = body, prev;
+		do {
+			prev = total;
+			char d[24];
+			int nd = snprintf(d, sizeof d, "%zu", prev);
+			total = body + (size_t)nd;
+		} while (total != prev);
+		if (len + total + 1 > cap) {
+			cap = (len + total + 1) * 2;
+			buf = realloc(buf, cap);
+			if (!buf)
+				die("out of memory");
+		}
+		len += (size_t)snprintf(buf + len, cap - len, "%zu %s=%s\n",
+					total, keys[k], vals[k]);
+	}
+
+	struct tarhdr h;
+	memset(&h, 0, sizeof h);
+	/* Name is cosmetic -- readers key off typeflag 'x' -- but mimic GNU so
+	 * a human reading `tar -tvf` output recognises it. */
+	const char *base = strrchr(forname, '/');
+	base = base ? base + 1 : forname;
+	snprintf(h.name, sizeof h.name, "PaxHeaders.%u/%.60s", pax_seq++, base);
+	put_num(h.mode, 8, 0644);
+	put_num(h.uid, 8, 0);
+	put_num(h.gid, 8, 0);
+	put_num(h.size, 12, len);
+	put_num(h.mtime, 12, 0);
+	h.typeflag = T_PAX;
+	finish_header(&h);
+	xwrite(afd, buf, len);
+	pad_to_block(len);
+	free(buf);
+}
+
 static void write_member(const char *path, const struct stat *st, int type,
 			 const char *link, uint64_t size)
 {
 	struct tarhdr h;
 	char name[100], prefix[155];
+	const char *paxpath = NULL, *paxlink = NULL;
 
-	split_name(path, name, prefix);
-	if (link && strlen(link) > 100) {
-		warn_("%s: link target over 100 bytes, truncated", path);
-		failures++;
+	if (split_name(path, name, prefix) < 0) {
+		paxpath = path;
+		/* Still store a truncated best-effort name: readers that ignore
+		 * pax get something, and GNU tar's own output does the same. */
+		memset(name, 0, 100);
+		memcpy(name, path, 99);
 	}
+	if (link && strlen(link) > 100)
+		paxlink = link;
+	if (paxpath || paxlink)
+		write_pax(path, paxpath, paxlink);
+
 	memset(&h, 0, sizeof h);
 	memcpy(h.name, name, 100);
 	memcpy(h.prefix, prefix, 155);
