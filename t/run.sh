@@ -41,6 +41,7 @@ build_tree() {
 	: >"$d/empty"
 	echo secret >"$d/mode700"; chmod 700 "$d/mode700"
 	echo world >"$d/mode400"; chmod 400 "$d/mode400"
+	echo suid >"$d/suid"; chmod 4755 "$d/suid"
 	printf 'a' >"$d/sp ace.txt"
 	printf 'b' >"$d/üñí©ode.txt"
 	ln -s a/f1 "$d/sym"
@@ -148,6 +149,19 @@ mkdir -p "$TMP/mid" "$TMP/rt2"
 "$GNUTAR" -cf "$TMP/mid.tar" -C "$TMP/mid" tree
 assert "tarx->GNU->tarx triple hop extracts" "$TARX" -xf "$TMP/mid.tar" -C "$TMP/rt2"
 assert "tarx->GNU->tarx: diff -r byte-identical" diff -r --no-dereference "$TMP/tree" "$TMP/rt2/tree"
+
+# A tar archive is untrusted input, so setuid/setgid bits from one must not be
+# honoured by an unprivileged extractor.  GNU tar drops them without -p; so do
+# we, and the oracle is what says what "right" means here.
+eq "setuid bit dropped on tarx extract (matches GNU default)" \
+	"$(stat -c %a "$TMP/rt/tree/suid")" "$(stat -c %a "$TMP/gx/tree/suid")"
+refute "setuid bit is not restored from an archive" \
+	sh -c "[ \"$(stat -c %a "$TMP/rt/tree/suid")\" = 4755 ]"
+# ...but the bit IS in the archive, so `tar -xp` can get it back.
+mkdir -p "$TMP/gp"
+"$GNUTAR" -xpf "$TMP/x.tar" -C "$TMP/gp" 2>/dev/null
+eq "tarx stored the setuid bit verbatim (GNU -xp restores 4755)" \
+	"$(stat -c %a "$TMP/gp/tree/suid")" 4755
 
 eq "tarx->GNU: >100 byte symlink target preserved (pax linkpath)" \
 	"$(readlink "$TMP/gx/tree/longsym")" "$(readlink "$TMP/tree/longsym")"
