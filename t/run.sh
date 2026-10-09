@@ -7,8 +7,28 @@ set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(dirname "$HERE")
 TARX=$ROOT/tarx
-TMP=$HERE/tmp
 GNUTAR=${GNUTAR:-tar}
+
+# Scratch carries the pid, and is removed on the way out. It was $HERE/tmp,
+# wiped at the start of every run, so two runs of this suite at once deleted
+# each other's fixtures mid-test. Hit for real: two instances of
+# .portfolio/extract.py overlapped and the repos with fixed scratch names
+# reported failures they do not have.
+#
+# Nothing used to remove it afterwards either, which left this repo's symlink
+# zoo -- a dangling link, an over-long one, and a loop 42 levels deep, all
+# built on purpose because refusing to follow a hostile symlink is what tarx
+# is for -- sitting in the tree permanently. unrepro could not check this repo
+# at all because of it: shutil.copytree follows symlinks by default, so it
+# raised on the dangling one and ELOOP on the loop, and reported a traceback
+# instead of a verdict. unrepro now copies links as links; this stops leaving
+# them behind in the first place.
+#
+# chmod before rm because the suite restores modes out of archives, and a
+# directory extracted without write permission cannot be deleted until it has
+# some.
+TMP=$HERE/tmp.$$
+trap 'chmod -R u+rwX "$TMP" 2>/dev/null; rm -rf "$TMP"' EXIT INT TERM
 
 rm -rf "$TMP"
 mkdir -p "$TMP"
