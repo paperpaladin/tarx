@@ -59,7 +59,7 @@ checked explicitly on top, because `diff` does not compare modes and, without
 long-name conventions: `posix` delivers the 150-byte path in a pax `path=`
 record, `gnu` and `oldgnu` deliver it in an `L` member.
 
-**Round trips.** `tarx → tarx`, and the three-hop `tarx → GNU tar → tarx`.
+**Round trips.** `tarx -> tarx`, and the three-hop `tarx -> GNU tar -> tarx`.
 
 **Byte-level assertions.** `diff -r` passing proves the two agree; it does not
 prove the encoding is *right*. Emitting a pax header for every long path would
@@ -116,8 +116,8 @@ Five distinct checks, because there are five distinct attacks:
 | --- | --- |
 | `/etc/cron.d/x` -- absolute member path | reject any name starting with `/` |
 | `../../escape` -- `..` component | reject any path component equal to `..` |
-| symlink `link` → `/etc`, then a member under `link/` | reject absolute symlink targets |
-| symlink `d/link` → `../../escape` | walk the target from the link's own directory; reject if the depth ever goes below the extraction root |
+| symlink `link` -> `/etc`, then a member under `link/` | reject absolute symlink targets |
+| symlink `d/link` -> `../../escape` | walk the target from the link's own directory; reject if the depth ever goes below the extraction root |
 | member `sub/up` is a legal symlink to `..`, then member `sub/up/escape` -- **nothing suspicious in either name** | `lstat` every parent component before creating it and refuse if any is a symlink; write files with `unlink` then `O_CREAT\|O_EXCL\|O_NOFOLLOW` so no open can ever resolve through a link |
 
 The checks run on the *final* name, after pax and GNU overrides are applied --
@@ -307,7 +307,7 @@ signed sums at once, so verification can accept the historic signed variant
 while we only ever write the unsigned one.
 
 *Create.* A recursive walk that sorts each directory so archives are
-reproducible, a small `(dev, ino) → first name` table that turns the second and
+reproducible, a small `(dev, ino) -> first name` table that turns the second and
 later names for an inode into `typeflag '1'` members, and `split_name`, which
 decides between the `prefix` split and a pax header. The pax record length field
 counts itself, so computing it is a two-iteration fixed point.
