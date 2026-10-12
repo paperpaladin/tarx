@@ -45,7 +45,7 @@ tar *is* the format. The harness drives both directions.
 
 **tarx writes, GNU tar reads.** `tarx -c` on a tree containing nested
 directories, a symlink, a relative symlink, a dangling symlink, a symlink whose
-*target* is 122 bytes (so it needs pax `linkpath=`), a hard link, an empty file,
+*target* is 121 bytes (so it needs pax `linkpath=`), a hard link, an empty file,
 a mode-0700 file, a mode-0400 file, a setuid file, filenames containing a space
 and non-ASCII UTF-8, a binary file full of NUL and 0xFF bytes, a 150-byte path
 that *can* be ustar-split and a 150-byte path that cannot. Then `tar -tvf` must list every member, `tar -xf` must extract it, and
@@ -95,7 +95,7 @@ a tarx-only round trip:
    passes into real ones.
 3. **Strict ustar genuinely cannot hold the test tree.** `tar --format=ustar`
    refuses to dump both the unsplittable 150-byte name (`file name is too long
-   (cannot be split); not dumped`) and the 122-byte symlink target (`link name
+   (cannot be split); not dumped`) and the 121-byte symlink target (`link name
    is too long`). That is the oracle stating, in its own words, that the
    `prefix`/`name` split is not a general solution and pax is not optional -- so
    the ustar leg of the suite runs against a fixture with those two members
@@ -151,10 +151,13 @@ mixed                     (good, bad, good -- the good two must still land)
 Plus: a destination that *already* contains `link -> ../outside` must not be
 written through; malformed input (truncated header, truncated mid-member,
 4 KiB of `/dev/urandom`, empty file) must exit cleanly and never on a signal;
-and 1000 single-byte mutations of a real archive are fed to the header parser
-asserting no crash. `make test-asan` runs the whole suite under
-`-fsanitize=address,undefined`, which is the build that matters most, since
-every byte the parser touches is attacker-controlled. Valgrind is clean on
+and 1000 mutations of a real archive -- 1 to 4 bytes each, not one -- are fed
+to the header parser asserting no crash. `make test-asan` sets
+`TARX_SKIP_BIG=1`, so it runs 113 of the 118 under
+`-fsanitize=address,undefined`; the five it drops are the 9 GiB sparse cases.
+That is still the build that matters most, since every byte the parser
+touches is attacker-controlled. (This said "the whole suite", contradicted
+ninety lines below by the same README's "runs those 113".) Valgrind is clean on
 create, list and extract too.
 
 ## make test
