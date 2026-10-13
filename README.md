@@ -244,7 +244,7 @@ ok   malformed[random]: exits cleanly (rc=2), no signal
 ok   malformed[zero]: exits cleanly (rc=0), no signal
 ok   1000 mutated archives: no crashes
 
-118 passed, 0 failed
+119 passed, 0 failed
 ```
 
 (Elided with `...` for length; the full run prints 118 `ok` lines and takes
