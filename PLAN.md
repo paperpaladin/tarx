@@ -34,67 +34,67 @@ not parseable.
 
 ## Hard invariant
 
-**1. GNU tar and tarx agree in both directions.** Anything `tarx -c` writes,
+1. GNU tar and tarx agree in both directions. Anything `tarx -c` writes,
 GNU `tar -tvf` lists correctly and `tar -xf` extracts to byte-identical files
 with the same modes, symlink targets and hard-link identity. Anything GNU tar
 writes in `ustar`, `gnu`, `oldgnu` or `posix`/`pax` format, `tarx -t` lists
 and `tarx -x` extracts to byte-identical files. Not `v7`: this said
 "`v7`-through-`pax`" and the harness has never covered v7, because v7 cannot
-represent the test fixture at all -- GNU tar refuses its long path outright
+represent the test fixture at all: GNU tar refuses its long path outright
 ("file name is too long (max 99); not dumped"), v7 having no prefix field.
 
-This is not a design goal, it is the acceptance test: if the two disagree,
+This is the acceptance test, not a design goal: if the two disagree,
 tarx is wrong, because tar is the format.
 
-**2. No member can ever be written outside the destination.** Not by an
+2. No member can ever be written outside the destination. Not by an
 absolute path, not by `..`, not by a symlink whose target climbs out, not by a
 file written *through* a symlink that an earlier member of the same archive
 created, not by a malicious path smuggled in via a pax `path=` record or a GNU
 `L` header. The response is refusal with a nonzero exit, never silent
-sanitisation -- an extractor that quietly rewrites the paths you asked about is
+sanitisation: an extractor that quietly rewrites the paths you asked about is
 worse than one that stops.
 
 ## Oracle
 
 Ranked, strongest first.
 
-1. **GNU tar 1.35, bidirectionally.** `tarx -c` -> `tar -xf` -> `diff -r
+1. GNU tar 1.35, bidirectionally. `tarx -c` -> `tar -xf` -> `diff -r
    --no-dereference` plus explicit `stat`/`readlink`/inode comparisons, and the
    reverse for `--format=` each of `gnu`, `oldgnu`, `posix`, `ustar`. Also the
    three-hop `tarx -> GNU -> tarx`. Non-negotiable: tar defines the format.
-2. **Byte-level assertions on the archive tarx produced.** `diff -r` passing
-   proves the pair agree, not that the encoding is right -- a pax header for
+2. Byte-level assertions on the archive tarx produced. `diff -r` passing
+   proves the pair agree, not that the encoding is right: a pax header for
    *every* long path would also pass. A Python reader walks the raw 512-byte
    blocks and asserts the splittable 150-byte path used `prefix`+`name` with no
    pax header, the unsplittable one produced a `path=` record, the 121-byte
    symlink target produced a `linkpath=` record, and the file ends in exactly
    two zero blocks and no more.
-3. **Traversal refusal, with the escape proven absent.** Fifteen hostile
+3. Traversal refusal, with the escape proven absent. Fifteen hostile
    archives (hand-written headers, plus two built by GNU `tar -P` so the oracle
    itself vouches that the nasty path really is in there). Each asserts a
    nonzero exit, a `REFUSING` message, that nothing appeared beside the
    destination directory, and that the payload string exists nowhere under the
    jail. A `/tmp` canary path checks the absolute case from the other side.
-4. **`diff -r --no-dereference`, not `diff -r`.** Plain `diff -r` follows
-   symlinks, so it compares what a link points at and not the link -- it would
+4. `diff -r --no-dereference`, not `diff -r`. Plain `diff -r` follows
+   symlinks, so it compares what a link points at and not the link. It would
    pass an extractor that got every target wrong, and it fails outright on a
    dangling one.
-5. **ASan + UBSan over the whole harness** (`make test-asan`), plus 1000
+5. ASan + UBSan over the whole harness (`make test-asan`), plus 1000
    mutations of a real archive, 1 to 4 bytes each, fed to the header parser,
    asserting
    no process ever dies on a signal. Valgrind is clean on create, list and
    extract but is not wired into `make test`.
-6. **`cmp` on a 9 GiB member**, and the size field read back through GNU tar
+6. `cmp` on a 9 GiB member, and the size field read back through GNU tar
    and through tarx, piped so neither side needs 9 GiB of archive on disk.
 
 ## Non-goals
 
 * Compression. No gzip, bzip2, xz, zstd. Pipe it: `tarx -cf - d | gzip >d.tgz`.
 * Sparse-file encoding. A 9 GiB hole is archived as 9 GiB of zeros and
-  extracted as 9 GiB of real blocks; GNU `--sparse` members are not read.
+  extracted as 9 GiB of real blocks. GNU `--sparse` members are not read.
 * xattrs, ACLs, SELinux labels, capabilities.
 * Restoring ownership. We never `chown`, so an unprivileged extract gives you
-  your own uid rather than failing. uid/gid/uname/gname are stored and listed.
+  your own uid instead of failing. uid/gid/uname/gname are stored and listed.
 * Creating device nodes (`mknod` needs root).
 * Appending, updating, deleting, `--diff`, member selection, wildcards,
   `--exclude`, `--strip-components`, incremental archives, volume labels,
@@ -133,16 +133,16 @@ Ranked, strongest first.
       guess.
 - [x] drop setuid/setgid/sticky bits on extract unless root
       why: the oracle caught us restoring 04755 where GNU tar restored 0755.
-      GNU is right -- an untrusted archive must not be able to hand an
-      unprivileged user a setuid file -- and it is a one-line policy, so it
-      belongs in the first release rather than a TODO.
+      GNU is right: an untrusted archive must not be able to hand an
+      unprivileged user a setuid file, and it is a one-line policy, so it
+      belongs in the first release, not a TODO.
 
-### Milestone 1 -- the gaps that bite real users
+### Milestone 1: the gaps that bite real users
 
 - [ ] read GNU sparse members (`typeflag` `S`, and pax
       `GNU.sparse.*` / sparse 1.0 map members)
       why: `tar --sparse` is common on VM images and database files, and we
-      currently fail them with a confusing size mismatch rather than a clear
+      currently fail them with a confusing size mismatch, not a clear
       "unsupported".
 - [ ] write sparse members by probing holes with `SEEK_HOLE`/`SEEK_DATA`
       why: archiving a 9 GiB hole as 9 GiB of literal zeros is the single
@@ -174,7 +174,7 @@ Ranked, strongest first.
       why: lexical analysis plus per-component `lstat` is correct but
       TOCTOU-racy against a concurrent writer in the destination; an
       `O_PATH` root fd and `openat` everywhere makes escape structurally
-      impossible rather than checked.
+      impossible, not checked.
 - [ ] `--list-verbose` time zone and locale handling to match GNU byte for
       byte, then diff the two listings in the harness
       why: right now the harness compares member *sets*, not the full `-tv`
@@ -183,7 +183,7 @@ Ranked, strongest first.
       permission policies are selectable and both match GNU exactly
       why: tarx currently sits between GNU's two modes (no umask like `-xp`,
       no setuid like plain `-x`), which is defensible but is a divergence the
-      harness documents rather than tests away.
+      harness documents, not tests away.
 - [ ] `-r`/`-u` (append and update) by seeking back over the zero blocks
       why: requires the archive fd to be seekable, which is the first place
       the pipe-friendly design has to grow a special case.
