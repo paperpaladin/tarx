@@ -163,7 +163,7 @@ Ranked, strongest first.
       hold, and we currently ignore them and use the (wrong) fallback field.
 - [ ] xattrs and ACLs: `SCHILY.xattr.*` records on read and write
       why: restoring a tree with capabilities or SELinux labels silently
-      loses them today, which is the dangerous kind of data loss.
+      loses them today, the dangerous kind of data loss.
 - [ ] `--numeric-owner` and a root-mode `chown`/`mknod` path
       why: tarx cannot currently be used to restore a system image.
 - [ ] `--strip-components=N` and member-name selection on extract
@@ -185,5 +185,5 @@ Ranked, strongest first.
       no setuid like plain `-x`), which is defensible but is a divergence the
       harness documents, not tests away.
 - [ ] `-r`/`-u` (append and update) by seeking back over the zero blocks
-      why: requires the archive fd to be seekable, which is the first place
+      why: requires the archive fd to be seekable, the first place
       the pipe-friendly design has to grow a special case.
