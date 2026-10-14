@@ -81,7 +81,7 @@ a tarx-only round trip:
 1. tarx was honouring setuid/setgid/sticky bits from an untrusted archive.
    `tarx -c` and GNU tar wrote byte-identical mode fields (`0004755`), but GNU
    tar extracted the file as `0755` and tarx extracted it as `04755`. GNU is
-   right: plain `tar -x` deliberately drops those bits unless you are root or
+   right. Plain `tar -x` deliberately drops those bits unless you are root or
    pass `-p`, because an archive should not be able to hand an unprivileged user
    a setuid file they did not ask for. tarx now drops them the same way, and the
    harness asserts both halves, that the extracted bit is gone, *and* that
