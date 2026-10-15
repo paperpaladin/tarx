@@ -43,7 +43,7 @@ and `tarx -x` extracts to byte-identical files. Not `v7`: this said
 represent the test fixture at all: GNU tar refuses its long path outright
 ("file name is too long (max 99); not dumped"), v7 having no prefix field.
 
-This is the acceptance test, not a design goal: if the two disagree,
+This is the acceptance test, not a design goal. If the two disagree,
 tarx is wrong, because tar is the format.
 
 2. No member can ever be written outside the destination. Not by an
@@ -63,7 +63,7 @@ Ranked, strongest first.
    reverse for `--format=` each of `gnu`, `oldgnu`, `posix`, `ustar`. Also the
    three-hop `tarx -> GNU -> tarx`. Non-negotiable: tar defines the format.
 2. Byte-level assertions on the archive tarx produced. `diff -r` passing
-   proves the pair agree, not that the encoding is right: a pax header for
+   proves the pair agree, not that the encoding is right. A pax header for
    *every* long path would also pass. A Python reader walks the raw 512-byte
    blocks and asserts the splittable 150-byte path used `prefix`+`name` with no
    pax header, the unsplittable one produced a `path=` record, the 121-byte
