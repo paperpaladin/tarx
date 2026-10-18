@@ -63,7 +63,8 @@ _Static_assert(sizeof(struct tarhdr) == BLK, "ustar header must be 512 bytes");
 enum {
 	T_REG = '0', T_LNK = '1', T_SYM = '2', T_CHR = '3', T_BLK = '4',
 	T_DIR = '5', T_FIFO = '6', T_CONT = '7',
-	T_PAX = 'x', T_PAXG = 'g', T_GNU_LONGNAME = 'L', T_GNU_LONGLINK = 'K'
+	T_PAX = 'x', T_PAXG = 'g', T_GNU_LONGNAME = 'L', T_GNU_LONGLINK = 'K',
+	T_GNU_SPARSE = 'S'
 };
 
 static const char *prog = "tarx";
@@ -761,11 +762,165 @@ static void mode_str(mode_t m, int type, char out[11])
 	out[10] = '\0';
 }
 
+/* ------------------------------------------------------- sparse members */
+
+/* GNU tar has written four different sparse encodings and the installed tar
+ * can still produce all four, so all four are read here:
+ *
+ *   old GNU (typeflag 'S', --format=gnu|oldgnu).  The map lives in the bytes
+ *     the ustar `prefix` field would occupy: four (offset, numbytes) pairs at
+ *     386, an `isextended` flag at 482, the apparent size at 483, and further
+ *     blocks of 21 pairs each when the flag is set.
+ *   pax 0.0 (--format=posix --sparse-version=0.0).  GNU.sparse.size plus
+ *     repeated GNU.sparse.offset / GNU.sparse.numbytes record pairs.
+ *   pax 0.1.  GNU.sparse.map=off,len,off,len,... in one record, and the real
+ *     member name in GNU.sparse.name (the header name is a decoy under
+ *     ./GNUSparseFile.<pid>/).
+ *   pax 1.0.  Only GNU.sparse.major/minor/name/realsize in the header; the
+ *     map itself is decimal ASCII at the START OF THE MEMBER DATA, padded to
+ *     a block boundary.
+ *
+ * In every case the header `size` field is the number of bytes actually
+ * stored, and the apparent size is carried separately.  Holes are never
+ * stored, so the member data is just the data extents end to end.
+ *
+ * shortcut: reading only.  `tarx -c` still writes every hole out as literal
+ * zeros, so a sparse member read here and written back is dense.  Upgrade
+ * path: probe the source file with SEEK_HOLE/SEEK_DATA and emit 1.0.
+ *
+ * shortcut: a format-0.1 map arrives in a single pax record, so PAX_MAX caps
+ * it at 1 MiB, which is about 30000 extents.  Ceiling: a more fragmented
+ * member than that is refused, not misread.  Upgrade path: stream the pax
+ * payload instead of buffering it whole. */
+
+/* A hostile archive picks this count.  16 bytes each, so a million entries is
+ * 16 MB: large enough for any real image, small enough not to be a weapon. */
+#define SP_MAX (1u << 20)
+
+struct sp_ent {
+	uint64_t off, len;
+};
+
+struct smap {
+	struct sp_ent *e;
+	size_t n, cap;
+	uint64_t real;		/* apparent size, holes included */
+	int have;		/* this member is sparse */
+	int v1;			/* GNU.sparse.major=1: map is in the data */
+};
+
+static void sp_add(struct smap *m, uint64_t off, uint64_t len)
+{
+	if (len == 0)
+		return;		/* unused header slot, or the end-of-file marker */
+	if (off > UINT64_MAX - len)
+		die("sparse extent at %llu overflows", (unsigned long long)off);
+	if (m->n == SP_MAX)
+		die("sparse map of more than %u extents", SP_MAX);
+	if (m->n == m->cap) {
+		m->cap = m->cap ? m->cap * 2 : 8;
+		m->e = realloc(m->e, m->cap * sizeof *m->e);
+		if (!m->e)
+			die("out of memory");
+	}
+	m->e[m->n].off = off;
+	m->e[m->n].len = len;
+	m->n++;
+}
+
+/* An extent that runs past the apparent size is what GNU tar calls an
+ * "invalid sparse archive member", and it exits 2 rather than extracting it.
+ * tarx has to agree: the alternative, widening the apparent size to fit, is
+ * letting a hostile archive decide how large a file we create. */
+static void sp_check(const struct smap *m, const char *path)
+{
+	for (size_t k = 0; k < m->n; k++)
+		if (m->e[k].off > m->real ||
+		    m->e[k].len > m->real - m->e[k].off)
+			die("%s: invalid sparse archive member", path);
+}
+
+static void sp_reset(struct smap *m)
+{
+	free(m->e);
+	memset(m, 0, sizeof *m);
+}
+
+/* Pull the (offset, numbytes) pairs out of a raw block at `base`, `cnt` of
+ * them, each 12 + 12 bytes of the usual octal-or-base-256 encoding. */
+static void sp_pairs(struct smap *m, const char *base, size_t cnt)
+{
+	for (size_t i = 0; i < cnt; i++) {
+		uint64_t off, len;
+		if (get_num(base + i * 24, 12, &off) < 0 ||
+		    get_num(base + i * 24 + 12, 12, &len) < 0)
+			die("bad sparse map entry");
+		sp_add(m, off, len);
+	}
+}
+
+/* An old-GNU 'S' header, plus however many continuation blocks it chains to.
+ * The continuation blocks sit in the stream between the header and the data,
+ * so this must run while listing as well as while extracting or everything
+ * after this member is read at the wrong offset. */
+static void sp_from_hdr(struct smap *m, const struct tarhdr *h)
+{
+	const char *p = (const char *)h;
+	uint64_t real;
+
+	if (get_num(p + 483, 12, &real) < 0)
+		die("bad sparse realsize field");
+	m->have = 1;
+	m->real = real;
+	sp_pairs(m, p + 386, 4);
+
+	int ext = (unsigned char)p[482];
+	while (ext) {
+		char blk[BLK];
+		if (xread(afd, blk, BLK) != BLK)
+			die("unexpected end of archive in a sparse map");
+		sp_pairs(m, blk, 21);
+		ext = (unsigned char)blk[504];
+	}
+}
+
+/* "off,len,off,len,..." -- the GNU.sparse.map record of format 0.1. */
+static void sp_from_list(struct smap *m, const char *v)
+{
+	while (*v) {
+		uint64_t num[2];
+		for (int k = 0; k < 2; k++) {
+			if (*v < '0' || *v > '9')
+				die("bad GNU.sparse.map record");
+			uint64_t x = 0;
+			while (*v >= '0' && *v <= '9') {
+				if (x > UINT64_MAX / 10 - 9)
+					die("bad GNU.sparse.map record");
+				x = x * 10 + (uint64_t)(*v++ - '0');
+			}
+			num[k] = x;
+			if (k == 0) {
+				if (*v != ',')
+					die("bad GNU.sparse.map record");
+				v++;
+			}
+		}
+		sp_add(m, num[0], num[1]);
+		if (*v == ',')
+			v++;
+		else if (*v)
+			die("bad GNU.sparse.map record");
+	}
+}
+
 /* Parse "<len> <key>=<value>\n" records.  `len` includes itself, so a record
  * can claim a length that runs off the end of the buffer -- check every step. */
-static void parse_pax(const char *buf, size_t n, char **path, char **link)
+static void parse_pax(const char *buf, size_t n, char **path, char **link,
+		      struct smap *sp)
 {
 	size_t i = 0;
+	uint64_t pend_off = 0;
+	int pend = 0;
 	while (i < n) {
 		size_t start = i, len = 0;
 		while (i < n && buf[i] >= '0' && buf[i] <= '9') {
@@ -788,20 +943,54 @@ static void parse_pax(const char *buf, size_t n, char **path, char **link)
 		char *val = xmalloc(vlen + 1);
 		memcpy(val, v, vlen);
 		val[vlen] = '\0';
-		if (klen == 4 && !memcmp(buf + i, "path", 4)) {
+		const char *k = buf + i;
+#define KEY(lit) (klen == sizeof(lit) - 1 && !memcmp(k, lit, sizeof(lit) - 1))
+		if (KEY("path")) {
 			free(*path);
 			*path = val;
-		} else if (klen == 8 && !memcmp(buf + i, "linkpath", 8)) {
+		} else if (KEY("linkpath")) {
 			free(*link);
 			*link = val;
+		} else if (KEY("GNU.sparse.name")) {
+			/* 0.1 and 1.0 hide the member under
+			 * ./GNUSparseFile.<pid>/ and put the real name here. */
+			free(*path);
+			*path = val;
+		} else if (KEY("GNU.sparse.size") || KEY("GNU.sparse.realsize")) {
+			sp->have = 1;
+			sp->real = strtoull(val, NULL, 10);
+			free(val);
+		} else if (KEY("GNU.sparse.major")) {
+			sp->have = 1;
+			if (strtoul(val, NULL, 10) == 1)
+				sp->v1 = 1;
+			free(val);
+		} else if (KEY("GNU.sparse.offset")) {
+			sp->have = 1;
+			pend_off = strtoull(val, NULL, 10);
+			pend = 1;
+			free(val);
+		} else if (KEY("GNU.sparse.numbytes")) {
+			sp->have = 1;
+			if (!pend)
+				die("GNU.sparse.numbytes without an offset");
+			sp_add(sp, pend_off, strtoull(val, NULL, 10));
+			pend = 0;
+			free(val);
+		} else if (KEY("GNU.sparse.map")) {
+			sp->have = 1;
+			sp_from_list(sp, val);
+			free(val);
 		} else {
-			/* shortcut: unknown pax keywords (size, mtime, uid,
-			 * atime, SCHILY.*, LIBARCHIVE.*) are ignored.  Ceiling:
-			 * a GNU-sparse-1.0 or >8EiB member would be read wrong.
-			 * Upgrade path: a keyword table feeding the same
-			 * override struct `path`/`link` already use. */
+			/* shortcut: pax keywords other than path, linkpath and
+			 * the GNU.sparse.* family are ignored (size, mtime,
+			 * uid, atime, SCHILY.*, LIBARCHIVE.*).  Ceiling: a
+			 * >8EiB member, or one whose mtime does not fit the
+			 * fixed field, is read wrong.  Upgrade path: a keyword
+			 * table feeding the same override struct. */
 			free(val);
 		}
+#undef KEY
 		i = end;
 	}
 }
@@ -825,9 +1014,8 @@ static char *read_data(uint64_t size, size_t *outn)
 	return buf;
 }
 
-static void skip_data(uint64_t size)
+static void skip_bytes(uint64_t total)
 {
-	uint64_t total = size + ((BLK - (size % BLK)) % BLK);
 	static char buf[1 << 16];
 	/* lseek would be faster but must work on pipes, so just read. */
 	while (total) {
@@ -836,6 +1024,11 @@ static void skip_data(uint64_t size)
 			die("unexpected end of archive");
 		total -= want;
 	}
+}
+
+static void skip_data(uint64_t size)
+{
+	skip_bytes(size + ((BLK - (size % BLK)) % BLK));
 }
 
 static void extract_data(const char *path, uint64_t size, mode_t mode)
@@ -876,9 +1069,106 @@ static void extract_data(const char *path, uint64_t size, mode_t mode)
 	chmod(path, mode);
 }
 
+/* The sparse-1.0 map is decimal ASCII at the front of the member data:
+ * "<count>\n<off>\n<len>\n..." NUL-padded to a block boundary.  It is read a
+ * block at a time because the archive may be a pipe. */
+static uint64_t sp_read_v1(struct smap *m, uint64_t stored)
+{
+	char blk[BLK];
+	size_t pos = BLK;
+	uint64_t used = 0, cnt, v;
+	int digits;
+
+#define SP_NEXT(dst)							\
+	do {								\
+		v = 0;							\
+		digits = 0;						\
+		for (;;) {						\
+			if (pos == BLK) {				\
+				if (used + BLK > stored)		\
+					die("truncated GNU sparse 1.0 map"); \
+				if (xread(afd, blk, BLK) != BLK)	\
+					die("unexpected end of archive in a sparse map"); \
+				used += BLK;				\
+				pos = 0;				\
+			}						\
+			char c = blk[pos++];				\
+			if (c == '\n')					\
+				break;					\
+			if (c < '0' || c > '9' || v > UINT64_MAX / 10 - 9) \
+				die("bad GNU sparse 1.0 map");		\
+			v = v * 10 + (uint64_t)(c - '0');		\
+			digits++;					\
+		}							\
+		if (!digits)						\
+			die("bad GNU sparse 1.0 map");			\
+		(dst) = v;						\
+	} while (0)
+
+	SP_NEXT(cnt);
+	if (cnt > SP_MAX)
+		die("sparse map of more than %u extents", SP_MAX);
+	for (uint64_t i = 0; i < cnt; i++) {
+		uint64_t off, len;
+		SP_NEXT(off);
+		SP_NEXT(len);
+		sp_add(m, off, len);
+	}
+#undef SP_NEXT
+	return used;
+}
+
+/* Write a sparse member: seek to each extent's offset, write its bytes, and
+ * set the final length with ftruncate so a file that ENDS in a hole gets the
+ * hole.  Whether the filesystem stores the gaps as holes is its business; the
+ * bytes are identical either way. */
+static void extract_sparse(const char *path, uint64_t stored, uint64_t used,
+			   struct smap *m, mode_t mode)
+{
+	sp_check(m, path);
+	if (unlink(path) < 0 && errno != ENOENT && errno != EISDIR) {
+		warn_("unlink %s: %s", path, strerror(errno));
+		failures++;
+	}
+	int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+	if (fd < 0) {
+		warn_("%s: %s", path, strerror(errno));
+		failures++;
+		skip_bytes(stored - used +
+			   ((BLK - (stored % BLK)) % BLK));
+		return;
+	}
+	static char buf[1 << 16];
+	for (size_t k = 0; k < m->n; k++) {
+		if (lseek(fd, (off_t)m->e[k].off, SEEK_SET) < 0)
+			die("%s: seek to %llu: %s", path,
+			    (unsigned long long)m->e[k].off, strerror(errno));
+		uint64_t left = m->e[k].len;
+		while (left) {
+			size_t want = left > sizeof buf ? sizeof buf : (size_t)left;
+			if (used + want > stored)
+				die("%s: sparse map claims more data than the "
+				    "member stores", path);
+			if (xread(afd, buf, want) != want)
+				die("unexpected end of archive in %s", path);
+			xwrite(fd, buf, want);
+			left -= want;
+			used += want;
+		}
+	}
+	if (ftruncate(fd, (off_t)m->real) < 0) {
+		warn_("ftruncate %s: %s", path, strerror(errno));
+		failures++;
+	}
+	close(fd);
+	skip_bytes(stored - used + ((BLK - (stored % BLK)) % BLK));
+	chmod(path, mode);
+}
+
 static void do_read(int extract)
 {
 	char *ov_path = NULL, *ov_link = NULL;
+	struct smap sp = { NULL, 0, 0, 0, 0, 0 };
 	int saw_any = 0;
 
 	for (;;) {
@@ -933,11 +1223,19 @@ static void do_read(int extract)
 		if (type == '\0')
 			type = T_REG;	/* ancient tars left it NUL */
 
+		/* The old GNU sparse member is a regular file whose map hides
+		 * in the prefix area; its continuation blocks must be consumed
+		 * here, before anything else touches the stream. */
+		if (type == T_GNU_SPARSE) {
+			sp_from_hdr(&sp, &h);
+			type = T_REG;
+		}
+
 		if (type == T_PAX || type == T_PAXG) {
 			size_t n;
 			char *d = read_data(size, &n);
 			if (type == T_PAX)
-				parse_pax(d, n, &ov_path, &ov_link);
+				parse_pax(d, n, &ov_path, &ov_link, &sp);
 			free(d);
 			continue;
 		}
@@ -1005,7 +1303,9 @@ static void do_read(int extract)
 				memcpy(gn, h.gname, 32);
 				gn[32] = '\0';
 				printf("%s %s/%s %11llu %s %s%s%s%s\n", ms,
-				       un, gn, (unsigned long long)size, ts, name,
+				       un, gn,
+				       (unsigned long long)(sp.have ? sp.real
+							    : size), ts, name,
 				       type == T_SYM ? " -> " : type == T_LNK ?
 				       " link to " : "",
 				       (type == T_SYM || type == T_LNK) ? lname : "",
@@ -1056,7 +1356,13 @@ static void do_read(int extract)
 			break;
 		case T_REG:
 		case T_CONT:
-			extract_data(clean, size, safe_mode(mode));
+			if (sp.have) {
+				uint64_t used = sp.v1 ? sp_read_v1(&sp, size) : 0;
+				extract_sparse(clean, size, used, &sp,
+					       safe_mode(mode));
+			} else {
+				extract_data(clean, size, safe_mode(mode));
+			}
 			set_times(clean, (time_t)mtime);
 			break;
 		case T_SYM:
@@ -1103,9 +1409,11 @@ static void do_read(int extract)
 		free(ov_path);
 		free(ov_link);
 		ov_path = ov_link = NULL;
+		sp_reset(&sp);
 	}
 	free(ov_path);
 	free(ov_link);
+	sp_reset(&sp);
 	if (extract)
 		flush_defers();
 }

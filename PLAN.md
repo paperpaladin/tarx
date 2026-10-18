@@ -27,6 +27,9 @@ In scope, on both the write and the read side:
 * link targets longer than 100 bytes, by pax `linkpath=`
 * files larger than 8 GiB, by **base-256 numeric fields**
 * GNU `L`/`K` long-name members and pax headers on read (we never write `L`/`K`)
+* GNU sparse members on read, in all four encodings GNU tar can still write:
+  the old typeflag `S` header with its continuation-block chain, and pax
+  `GNU.sparse.*` versions 0.0, 0.1 and 1.0
 * the terminating pair of 512-byte zero blocks
 
 Exit status: 0 success, 1 something was skipped or refused, 2 the archive is
@@ -86,12 +89,19 @@ Ranked, strongest first.
    extract but is not wired into `make test`.
 6. `cmp` on a 9 GiB member, and the size field read back through GNU tar
    and through tarx, piped so neither side needs 9 GiB of archive on disk.
+7. For sparse members, GNU tar's own extraction of the same archive. Byte
+   content and apparent size say the holes are in the right place; `stat -c
+   %b` against what GNU allocated says they were written as holes and not as
+   zeros, and is compared to the oracle rather than to a constant because
+   whether a gap becomes a hole is the filesystem's decision. A dense
+   extraction of the right bytes is still correct and must pass.
 
 ## Non-goals
 
 * Compression. No gzip, bzip2, xz, zstd. Pipe it: `tarx -cf - d | gzip >d.tgz`.
-* Sparse-file encoding. A 9 GiB hole is archived as 9 GiB of zeros and
-  extracted as 9 GiB of real blocks. GNU `--sparse` members are not read.
+* Sparse-file encoding on the WRITE side. A 9 GiB hole is archived as 9 GiB
+  of literal zeros. Reading a sparse member is in scope and done; writing one
+  is the next item in the sequence.
 * xattrs, ACLs, SELinux labels, capabilities.
 * Restoring ownership. We never `chown`, so an unprivileged extract gives you
   your own uid instead of failing. uid/gid/uname/gname are stored and listed.
@@ -139,11 +149,25 @@ Ranked, strongest first.
 
 ### Milestone 1: the gaps that bite real users
 
-- [ ] read GNU sparse members (`typeflag` `S`, and pax
+- [x] read GNU sparse members (`typeflag` `S`, and pax
       `GNU.sparse.*` / sparse 1.0 map members)
       why: `tar --sparse` is common on VM images and database files, and we
       currently fail them with a confusing size mismatch, not a clear
       "unsupported".
+      done: all four encodings the installed GNU tar 1.35 can write are read,
+      none refused. `--sparse-version=` is only honoured by `--format=posix`;
+      `--format=gnu` and `--format=oldgnu` write the old `S` header whatever
+      version is asked for, so the suite asserts which encoding is in each
+      archive before testing it, or five legs would have tested one format.
+      The fixture has a hole at offset 0, six more in the middle, a hole at
+      the very end, and eight data extents, which is more than the four an
+      `S` header holds and so exercises the continuation-block chain; a second
+      fixture is nothing but hole. Each is checked for byte content, apparent
+      size and `stat -c %b` against GNU tar's own extraction of the same
+      archive. 12 mutations, 11 killed; the survivor is recorded in the README.
+      The oracle changed the design once: tarx first widened the apparent size
+      to cover an extent that ran past it, and GNU tar rejects that archive as
+      an "invalid sparse archive member", so tarx refuses it too.
 - [ ] write sparse members by probing holes with `SEEK_HOLE`/`SEEK_DATA`
       why: archiving a 9 GiB hole as 9 GiB of literal zeros is the single
       worst behaviour in the tool today.
