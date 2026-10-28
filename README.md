@@ -75,7 +75,33 @@ of archive on disk: `tarx -cf - | tar -tvf -` must report 9663676416, and
 file `cmp` calls identical. If the filesystem refuses the 9 GiB file the harness
 says so and skips, instead of passing quietly.
 
-What the interop test caught. Three real things, all of them invisible to
+Sparse members. GNU tar has written four sparse encodings over the years
+and the installed 1.35 can still produce all four, so the suite drives all
+four: the old typeflag `S` header with its continuation-block chain
+(`--format=gnu` and `--format=oldgnu`), and pax `GNU.sparse.*` versions 0.0,
+0.1 and 1.0 (`--format=posix --sparse-version=`). None is refused.
+
+`--sparse-version=` is only honoured by `--format=posix`. `gnu` and `oldgnu`
+write the old `S` header whatever version you ask for, so the suite first
+reads the raw blocks back and asserts which encoding is actually in the
+archive; without that, five legs would have been testing one format and
+reporting five passes.
+
+The fixture is built to make the holes matter: a hole at offset 0, six more
+in the middle, a hole at the very end (the classic off-by-one, since only the
+final `ftruncate` puts that one back), and eight data extents, which is more
+than the four an `S` header holds and so forces the continuation chain. A
+second fixture is nothing but hole, and a third is dense. Three separate
+assertions per member: `cmp` against the original, which catches a hole in
+the wrong *place* because the bytes move; the apparent size, which catches a
+lost trailing hole; and `stat -c %b` against what GNU TAR'S OWN EXTRACTION of
+the same archive allocated, which catches writing the holes out as real zero
+blocks. The last is compared to the oracle rather than to a number of our
+own, because whether a gap becomes a hole is the filesystem's decision; an
+extractor that produced a dense file of the right bytes would still be
+correct, and would still pass.
+
+What the interop test caught. Four real things, all of them invisible to
 a tarx-only round trip:
 
 1. tarx was honouring setuid/setgid/sticky bits from an untrusted archive.
@@ -93,7 +119,18 @@ a tarx-only round trip:
    target wrong, and it aborted outright on a dangling link. `diff -r
    --no-dereference` plus an explicit `readlink` per link turned three vacuous
    passes into real ones.
-3. Strict ustar genuinely cannot hold the test tree. `tar --format=ustar`
+3. tarx was widening the apparent size of a sparse member to fit its map.
+   A hand-written `S` header that declares a 0-byte file and then a 512-byte
+   extent at offset 0 was extracted by tarx as a 512-byte file. GNU tar calls
+   that archive an `invalid sparse archive member` and exits 2, which is
+   right: letting the extent list override the declared size is letting a
+   hostile archive decide how large a file we create. tarx refuses it now,
+   and the harness asserts both halves, that tarx exits nonzero *and* that
+   GNU tar rejects the same archive, so the refusal is not one we invented.
+   The bug was found by mutation testing: deleting the widening changed
+   nothing in the suite, which is what sent me to ask the oracle what the
+   widening was for.
+4. Strict ustar genuinely cannot hold the test tree. `tar --format=ustar`
    refuses to dump both the unsplittable 150-byte name (`file name is too long
    (cannot be split); not dumped`) and the 121-byte symlink target (`link name
    is too long`). That is the oracle stating, in its own words, that the
@@ -151,13 +188,18 @@ mixed                     (good, bad, good -- the good two must still land)
 Plus: a destination that *already* contains `link -> ../outside` must not be
 written through; malformed input (truncated header, truncated mid-member,
 4 KiB of `/dev/urandom`, empty file) must exit cleanly and never on a signal;
-and 1000 mutations of a real archive (1 to 4 bytes each, not one) are fed
-to the header parser asserting no crash. `make test-asan` sets
-`TARX_SKIP_BIG=1`, so it runs 113 of the 118 under
-`-fsanitize=address,undefined`. The five it drops are the 9 GiB sparse cases.
+three hand-written sparse archives whose maps lie (a continuation chain that
+stops at EOF, a map claiming more data than the member stores, and one extent
+running past the declared size) must be refused with nothing written past the
+stored bytes; and 1000 mutations of a real archive (1 to 4 bytes each, not
+one) are fed to the header parser asserting no crash. The sparse three are
+hand-written because the byte-flip fuzzer will essentially never produce an
+`S` typeflag by chance, and the map is as attacker-controlled as a path is. `make test-asan` sets
+`TARX_SKIP_BIG=1`, so it runs 167 of the 172 under
+`-fsanitize=address,undefined`. The five it drops are the 9 GiB cases.
 That is still the build that matters most, since every byte the parser
 touches is attacker-controlled. (This said "the whole suite", contradicted
-ninety lines below by the same README's "runs those 113".) Valgrind is clean on
+ninety lines below by the same README's own figure, which was also stale.) Valgrind is clean on
 create, list and extract too.
 
 ## make test
@@ -212,6 +254,16 @@ ok   GNU->tarx: tarx reads GNU's base-256 9G size
 ok   tarx round-trips a 9G member
 ok   9G member extracts at full size
 ok   9G member is byte-identical
+ok   sparse fixture really is sparse (8192 blocks for 10485760 bytes)
+ok   GNU tar really wrote oldgnu (oracle sanity)
+ok   sparse[oldgnu]: tarx -x succeeds
+ok   sparse[oldgnu]: holes size and allocation match GNU's extract
+ok   sparse[oldgnu]: holes is byte-identical to the original
+ok   sparse[oldgnu]: allhole size and allocation match GNU's extract
+...
+ok   GNU tar really wrote pax1.0 (oracle sanity)
+ok   sparse[pax1.0]: tarx -tv reports the apparent sizes
+ok   sparse: GNU -> tarx -> GNU is byte-identical
 ok   GNU tar -P really stored '../escape' (oracle sanity)
 ok   GNU tar -P really stored an absolute path (oracle sanity)
 ok   refuse[abs_prefix]: nonzero exit and a REFUSING message
@@ -242,15 +294,20 @@ ok   malformed[trunc_hdr]: exits cleanly (rc=2), no signal
 ok   malformed[trunc_mid]: exits cleanly (rc=2), no signal
 ok   malformed[random]: exits cleanly (rc=2), no signal
 ok   malformed[zero]: exits cleanly (rc=0), no signal
+ok   malformed[sp_trunc]: refused cleanly (rc=2), no signal
+ok   malformed[sp_overclaim]: refused cleanly (rc=2), no signal
+ok   malformed[sp_short]: refused cleanly (rc=2), no signal
+ok   malformed[sp_overclaim]: no data written past the stored size
+ok   GNU tar also rejects sp_short (oracle sanity)
 ok   1000 mutated archives: no crashes
 
-119 passed, 0 failed
+172 passed, 0 failed
 ```
 
-(Elided with `...` for length. The full run prints 118 `ok` lines and takes
-about 35 seconds, nearly all of it the 9 GiB member. `TARX_SKIP_BIG=1 t/run.sh`
-drops to 113 tests in under a second, and `make test-asan` runs those 113 under
-`-fsanitize=address,undefined`.)
+(Elided with `...` for length. The full run prints 172 `ok` lines and takes
+about 40 seconds, nearly all of it the 9 GiB member. `TARX_SKIP_BIG=1 t/run.sh`
+drops to 167 tests in a couple of seconds, and `make test-asan` runs those 167
+under `-fsanitize=address,undefined`.)
 
 ## Status
 
@@ -258,24 +315,36 @@ What works: ustar read and write; directories, regular files, symlinks
 (including relative and dangling ones), hard links, FIFOs; mode bits and mtime;
 paths over 100 bytes via both the `prefix`/`name` split and pax `path=`; link
 targets over 100 bytes via pax `linkpath=`; sizes over 8 GiB via base-256;
-reading pax `x`/`g` headers and GNU `L`/`K` members; the two-zero-block
-terminator; `-f -` for pipes; the full traversal-refusal set above. Clean under
+reading pax `x`/`g` headers and GNU `L`/`K` members; reading GNU sparse
+members in all four encodings (old `S` plus pax 0.0, 0.1 and 1.0); the
+two-zero-block terminator; `-f -` for pipes; the full traversal-refusal set above. Clean under
 `-Wall -Wextra`, ASan, UBSan and Valgrind.
 
 What does not work, honestly:
 
 * No compression. No `-z`/`-j`/`-J`. Pipe through `gzip`.
-* No sparse-file support, in either direction. A 9 GiB hole is archived as
-  9 GiB of literal zeros and extracted as 9 GiB of real blocks. GNU `--sparse`
-  members (`typeflag` `S`, `GNU.sparse.*` pax records) are not understood and
-  will extract wrongly instead of being rejected, this is the worst remaining
-  gap and the first item in PLAN.md.
+* No sparse-file support on the WRITE side. Sparse members are read, in all
+  four encodings GNU tar 1.35 can write, and none is refused. But `tarx -c`
+  has no hole detection at all, so a 9 GiB hole is still archived as 9 GiB of
+  literal zeros, and a sparse member read out of a GNU archive and written
+  back by tarx comes out dense. That is the next item in PLAN.md.
+* A format-0.1 sparse map arrives in one pax record and the pax payload cap
+  is 1 MiB, so a member fragmented into more than roughly 30000 extents is
+  refused rather than read. 0.0 has the same cap over the whole record set.
+  1.0 and the old `S` header stream their maps and have no such limit.
+* One sparse mutation survives and is left alone deliberately: keeping the
+  zero-length entries in the map instead of dropping them. GNU tar writes an
+  (offset, 0) entry as an end-of-map marker and leaves the unused slots of an
+  `S` header all-NUL, and a zero-length extent makes the extractor seek and
+  then write nothing, so the two versions produce identical bytes, identical
+  sizes and identical allocation. It is equivalent, not untested.
 * No xattrs, ACLs, SELinux labels or capabilities. Silently dropped.
 * No ownership restore. We never `chown`, so everything lands owned by the
   extracting user. uid/gid/uname/gname *are* stored and shown by `-tv`.
 * No device nodes created on extract (listed, then skipped, `mknod` needs
   root).
-* Pax keywords other than `path` and `linkpath` are ignored, including
+* Pax keywords other than `path`, `linkpath` and the `GNU.sparse.*` family
+  are ignored, including
   `size`, `mtime`, `uid` and `gname`. For `--format=posix` archives whose values
   do fit the fixed fields this is harmless. For the rare ones where they do not,
   tarx uses the fallback field and gets it wrong.
@@ -301,7 +370,7 @@ What does not work, honestly:
 
 ## Design
 
-One file, 1181 lines, three parts.
+One file, 1489 lines, three parts.
 
 *Header codec.* A `struct tarhdr` of nothing but `char` arrays, so it has no
 padding and a `_Static_assert` pins `sizeof` at 512. `put_num`/`get_num` handle
@@ -314,6 +383,18 @@ reproducible, a small `(dev, ino) -> first name` table that turns the second and
 later names for an inode into `typeflag '1'` members, and `split_name`, which
 decides between the `prefix` split and a pax header. The pax record length field
 counts itself, so computing it is a two-iteration fixed point.
+
+*Sparse.* All four GNU encodings collapse onto one `struct smap`: a list of
+(offset, length) extents plus the apparent size. Where the map comes from is
+the only thing that differs, and it differs a lot. An old `S` header hides it
+in the bytes the ustar `prefix` would use, chained through continuation
+blocks that sit between the header and the data, so they have to be consumed
+while *listing* as well as while extracting or every member after this one is
+read at the wrong offset. Formats 0.0 and 0.1 put it in pax records. Format
+1.0 puts it in decimal ASCII at the front of the member data itself, which is
+read a block at a time because the archive may be a pipe. Extraction seeks to
+each extent, writes it, and ends with one `ftruncate` to the apparent size,
+which is the only thing that restores a hole at the end of the file.
 
 *Read.* One loop over 512-byte blocks. Pax `x` and GNU `L`/`K` members set
 `ov_path`/`ov_link` overrides consumed by the *next* real member, also

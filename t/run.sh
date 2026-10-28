@@ -257,6 +257,132 @@ else
 fi
 
 # ===================================================================== #
+# 6b. GNU sparse members, all four encodings GNU tar can still write    #
+# ===================================================================== #
+# The whole point of a sparse file is where the holes are, so the fixture has
+# a hole at offset 0, six more at different offsets, and ends in a hole -- the
+# last is the classic off-by-one, because only the final ftruncate puts it
+# back.  `holes` has eight data extents, more than the four an old-GNU 'S'
+# header can hold, so it also forces the continuation-block chain.
+#
+# Three things are asserted per format and they catch different failures.
+# `cmp` against the original catches a hole in the wrong PLACE, because the
+# bytes move.  The apparent size catches a lost trailing hole.  And
+# `stat -c %b` against what GNU TAR'S OWN EXTRACTION allocated catches writing
+# the holes out as real zero blocks -- compared to the oracle rather than to a
+# number of our own, because whether a gap becomes a hole is the filesystem's
+# decision and not ours.
+mkdir -p "$TMP/sparse"
+python3 - "$TMP/sparse" <<'PY'
+import sys, os
+d = sys.argv[1]
+f = open(os.path.join(d, 'holes'), 'wb')
+f.seek(1 << 20)                     # hole at the very start
+for i in range(8):
+    f.seek((2 * i + 2) << 19)       # 512 KiB of data every 1 MiB
+    f.write(bytes([65 + i]) * (1 << 19))
+f.truncate(10 << 20)                # ... and a 1 MiB hole at the very end
+f.close()
+open(os.path.join(d, 'allhole'), 'wb').truncate(1 << 20)   # nothing but hole
+open(os.path.join(d, 'dense'), 'wb').write(b'not sparse at all\n')
+PY
+
+# A fixture with no holes tests nothing, so prove this one has them before
+# believing anything below.
+sp_apparent=$(stat -c %s "$TMP/sparse/holes")
+sp_alloc=$(stat -c %b "$TMP/sparse/holes")
+if [ "$((sp_alloc * 512))" -lt "$((sp_apparent / 2))" ]; then
+	ok "sparse fixture really is sparse ($sp_alloc blocks for $sp_apparent bytes)"
+else
+	no "sparse fixture is not sparse: $sp_alloc blocks for $sp_apparent bytes"
+fi
+
+# Which encoding is actually in the archive.  --sparse-version is only honoured
+# by --format=posix; gnu and oldgnu write the old 'S' header whatever is asked
+# for, so without this the five legs below could all be testing one format.
+cat >"$TMP/sparsefmt.py" <<'PY'
+import sys
+d = open(sys.argv[1], 'rb').read()
+off, seen = 0, set()
+while off + 512 <= len(d) and d[off:off+512] != b'\0' * 512:
+    h = d[off:off+512]
+    tf = chr(h[156])
+    size = int(h[124:136].rstrip(b'\0 ').decode() or '0', 8)
+    off += 512
+    if tf == 'S':
+        seen.add('oldgnu-S')
+        # The continuation blocks of an 'S' map sit between the header and
+        # the data and are NOT counted in the size field.  Walking over them
+        # as though they were headers is how the first version of this
+        # checker crashed on exactly the archives it was written for.
+        ext = h[482]
+        while ext:
+            ext = d[off + 504]
+            off += 512
+    elif tf == 'x':
+        body = d[off:off+size]
+        if b'GNU.sparse.major=1' in body:
+            seen.add('1.0')
+        elif b'GNU.sparse.map=' in body:
+            seen.add('0.1')
+        elif b'GNU.sparse.numbytes=' in body:
+            seen.add('0.0')
+    off += ((size + 511) // 512) * 512
+print(','.join(sorted(seen)) or 'none')
+PY
+
+sparse_leg() {
+	local tag=$1 want=$2; shift 2
+	local ar=$TMP/sp-$tag.tar
+	rm -rf "$TMP/sp-x-$tag" "$TMP/sp-g-$tag"
+	mkdir -p "$TMP/sp-x-$tag" "$TMP/sp-g-$tag"
+	if ! "$GNUTAR" --sparse "$@" -cf "$ar" -C "$TMP/sparse" \
+	     holes allhole dense 2>/dev/null; then
+		no "GNU tar writes $tag sparse members"
+		return
+	fi
+	eq "GNU tar really wrote $tag (oracle sanity)" \
+		"$(python3 "$TMP/sparsefmt.py" "$ar")" "$want"
+	assert "sparse[$tag]: tarx -x succeeds" \
+		"$TARX" -xf "$ar" -C "$TMP/sp-x-$tag"
+	"$GNUTAR" -xf "$ar" -C "$TMP/sp-g-$tag" 2>/dev/null
+	local f
+	for f in holes allhole dense; do
+		# apparent size AND allocated blocks, both against GNU's own
+		# extraction of the same archive.
+		eq "sparse[$tag]: $f size and allocation match GNU's extract" \
+			"$(stat -c '%s %b' "$TMP/sp-x-$tag/$f" 2>/dev/null)" \
+			"$(stat -c '%s %b' "$TMP/sp-g-$tag/$f" 2>/dev/null)"
+		assert "sparse[$tag]: $f is byte-identical to the original" \
+			cmp "$TMP/sparse/$f" "$TMP/sp-x-$tag/$f"
+	done
+	# -t must report the apparent size, not the stored one.
+	eq "sparse[$tag]: tarx -tv reports the apparent sizes" \
+		"$("$TARX" -tvf "$ar" | awk '{print $3}' | tr '\n' ' ')" \
+		"$("$GNUTAR" -tvf "$ar" | awk '{print $3}' | tr '\n' ' ')"
+	rm -rf "$TMP/sp-x-$tag" "$TMP/sp-g-$tag" "$ar"
+}
+
+sparse_leg oldgnu  oldgnu-S --format=oldgnu
+sparse_leg gnu     oldgnu-S --format=gnu
+sparse_leg pax0.0  0.0      --format=posix --sparse-version=0.0
+sparse_leg pax0.1  0.1      --format=posix --sparse-version=0.1
+sparse_leg pax1.0  1.0      --format=posix --sparse-version=1.0
+
+# Three hops with GNU in the middle: tarx has to read a sparse member and
+# write it back as an ordinary dense one that GNU still accepts.  tarx cannot
+# write sparse members yet, so this is the whole of the write half.
+mkdir -p "$TMP/sp-hop" "$TMP/sp-hop-out"
+"$GNUTAR" --sparse --format=gnu -cf "$TMP/sp-hop.tar" -C "$TMP/sparse" holes
+"$TARX" -xf "$TMP/sp-hop.tar" -C "$TMP/sp-hop" 2>/dev/null
+assert "sparse: tarx -> GNU reads back the de-sparsed member" \
+	sh -c "'$TARX' -cf - -C '$TMP/sp-hop' holes | '$GNUTAR' -xf - -C '$TMP/sp-hop-out'"
+assert "sparse: GNU -> tarx -> GNU is byte-identical" \
+	cmp "$TMP/sparse/holes" "$TMP/sp-hop-out/holes"
+rm -rf "$TMP/sp-hop" "$TMP/sp-hop-out" "$TMP/sp-hop.tar" "$TMP/sparse" \
+	"$TMP/sparsefmt.py"
+
+# ===================================================================== #
 # 7. SECURITY: path traversal must be REFUSED, not sanitised            #
 # ===================================================================== #
 # Each case extracts into $TMP/jail/dest and then proves (a) tarx exited
@@ -437,6 +563,65 @@ for bad in trunc_hdr trunc_mid random zero; do
 		no "malformed[$bad]: died with signal (rc=$rc)"
 	fi
 done
+
+# A sparse map is as attacker-controlled as a path is, and the byte-flip
+# fuzzer below will essentially never produce an 'S' typeflag by chance, so
+# the two ways a map can lie get their own hand-written archives.
+python3 - "$TMP" <<'PY'
+import sys
+tmp = sys.argv[1]
+
+def shdr(name, stored, realsize, pairs, isext=0):
+    h = bytearray(512)
+    h[0:len(name)] = name.encode()
+    h[100:108] = b'%07o\0' % 0o644
+    h[108:116] = b'%07o\0' % 0
+    h[116:124] = b'%07o\0' % 0
+    h[124:136] = b'%011o\0' % stored
+    h[136:148] = b'%011o\0' % 0
+    h[148:156] = b' ' * 8
+    h[156] = ord('S')
+    h[257:263] = b'ustar '
+    h[263:265] = b' \0'
+    for i, (o, n) in enumerate(pairs):
+        h[386+i*24:386+i*24+12] = b'%011o\0' % o
+        h[386+i*24+12:386+i*24+24] = b'%011o\0' % n
+    h[482] = isext
+    h[483:495] = b'%011o\0' % realsize
+    h[148:156] = b'%06o\0 ' % sum(h)
+    return bytes(h)
+
+# isextended says another map block follows, and the archive stops instead.
+open(tmp + '/sp_trunc.tar', 'wb').write(shdr('t', 0, 1 << 20, [], isext=1))
+# The map claims 64 KiB of data where the member stores 512 bytes, and the
+# archive is long enough that reading the difference would SUCCEED, swallowing
+# the blocks that follow.  Without the used+want>stored guard this extracts a
+# 1 MiB file full of the rest of the archive instead of failing.
+open(tmp + '/sp_overclaim.tar', 'wb').write(
+    shdr('t', 512, 1 << 20, [(0, 1 << 16)]) + b'Z' * 512 + b'\0' * (200 * 512))
+# An extent that ends past the apparent size.  GNU tar calls this an invalid
+# sparse archive member and exits 2; the assertion below makes it say so.
+open(tmp + '/sp_short.tar', 'wb').write(
+    shdr('t', 512, 0, [(0, 512)]) + b'Z' * 512 + b'\0' * 1024)
+PY
+for bad in sp_trunc sp_overclaim sp_short; do
+	rm -rf "$TMP/spjail-$bad"; mkdir -p "$TMP/spjail-$bad"
+	"$TARX" -xf "$TMP/$bad.tar" -C "$TMP/spjail-$bad" >/dev/null 2>&1
+	rc=$?
+	if [ "$rc" -ge 1 ] && [ "$rc" -lt 128 ]; then
+		ok "malformed[$bad]: refused cleanly (rc=$rc), no signal"
+	else
+		no "malformed[$bad]: rc=$rc (want nonzero and under 128)"
+	fi
+done
+# The refusal has to be a refusal, not a partial extraction: nothing may be
+# written past the bytes the member actually stores.
+eq "malformed[sp_overclaim]: no data written past the stored size" \
+	"$(stat -c %s "$TMP/spjail-sp_overclaim/t" 2>/dev/null || echo missing)" "0"
+# ... and GNU tar must agree that sp_short is invalid, or we are refusing a
+# member the format allows.
+refute "GNU tar also rejects sp_short (oracle sanity)" \
+	"$GNUTAR" -xf "$TMP/sp_short.tar" -C "$TMP/spjail-sp_short"
 
 # A thousand mutations of a real archive, 1 to 4 bytes each: the header parser must
 # never fault.  Cheap stand-in for the real fuzzer in PLAN.md.
